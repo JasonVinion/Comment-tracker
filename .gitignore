@@ -1,0 +1,109 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# Build directories
+build/
+cmake-build-*/
+out/
+build_x64/
+mybuild/
+mybuild_vs/
+**/build/
+**/build-*/
+**/cmake-build-*/
+**/out/
+
+# IDE files
+.idea/
+.vscode/
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Qt generated files
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+*.moc
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Backup files
+*.bak
+.comment-explorer-backups/
+
+# Logs
+*.log
+
+# vcpkg
+vcpkg_installed/
+**/vcpkg_installed/
+vcpkg/buildtrees/
+vcpkg/packages/
+vcpkg/downloads/
+
+# Inno Setup output
+installer/output/
+installer/package/
+
+# Local build status files
+BUILD_COMPLETE.txt
+BUILD_SUCCESS_REPORT.md
+
+# CodeQL artifacts
+_codeql_build_dir/
+_codeql_detected_source_root
