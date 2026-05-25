@@ -100,9 +100,14 @@ vcpkg/downloads/
 installer/output/
 installer/package/
 
+# Local scripts
+installer/prepare-package.ps1
+tools/generate-icon.ps1
+
 # Local build status files
 BUILD_COMPLETE.txt
 BUILD_SUCCESS_REPORT.md
+RELEASE.md
 
 # CodeQL artifacts
 _codeql_build_dir/
