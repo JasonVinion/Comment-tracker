@@ -1,4 +1,6 @@
 #include <QtTest/QtTest>
+#include <QDir>
+#include <QCoreApplication>
 #include "CommentExtractor.h"
 #include "LanguageRegistry.h"
 
@@ -31,6 +33,9 @@ private slots:
     // Keyword detection
     void testTodoKeyword();
     void testMultipleKeywords();
+    
+    // Harvesting live test
+    void testHarvesting();
     
 private:
     CommentExtractor* extractor;
@@ -196,6 +201,120 @@ void TestCommentExtractor::testMultipleKeywords() {
     QCOMPARE(comments.size(), 1);
     QVERIFY(comments[0].keywords.contains("TODO"));
     QVERIFY(comments[0].keywords.contains("FIXME"));
+}
+
+void TestCommentExtractor::testHarvesting() {
+    QString testDir;
+    QDir current(QCoreApplication::applicationDirPath());
+    for (int i = 0; i < 6; ++i) {
+        if (current.exists("test_examples")) {
+            testDir = current.filePath("test_examples");
+            break;
+        }
+        if (!current.cdUp()) break;
+    }
+    
+    QDir dir(testDir);
+    QVERIFY(dir.exists());
+    
+    QStringList files = dir.entryList({"*.cpp", "*.py", "*.c", "*.php"}, QDir::Files);
+    QVERIFY(files.size() >= 4);
+    
+    QVector<Comment> allComments;
+    for (const QString& file : files) {
+        QString fullPath = dir.filePath(file);
+        auto comments = extractor->extractFromFile(fullPath, file);
+        allComments.append(comments);
+    }
+    
+    QMap<QString, QVector<Comment>> commentsByFile;
+    for (const Comment& c : allComments) {
+        commentsByFile[c.filePath].append(c);
+    }
+    
+    static const QStringList matchTerms = {
+        "todo", "fix", "hack", "fix later", 
+        "partial implmentation", "partial implementation",
+        "simple implmentation", "simple implementation",
+        "example", "do later", "unstable",
+        "xxx", "bug", "deprecated", "warning", "optimize", "review"
+    };
+    
+    auto isSpecial = [](const Comment& comment) -> bool {
+        QString cleanTextLower = comment.cleanText.toLower();
+        QString rawTextLower = comment.rawText.toLower();
+        
+        for (const QString& term : matchTerms) {
+            if (cleanTextLower.contains(term) || rawTextLower.contains(term)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    
+    int exportedGroupsCount = 0;
+    int exportedCommentsCount = 0;
+    
+    for (auto it = commentsByFile.begin(); it != commentsByFile.end(); ++it) {
+        QVector<Comment> fileComments = it.value();
+        
+        std::sort(fileComments.begin(), fileComments.end(), [](const Comment& a, const Comment& b) {
+            if (a.startLine != b.startLine) {
+                return a.startLine < b.startLine;
+            }
+            return a.startColumn < b.startColumn;
+        });
+        
+        QVector<QVector<Comment>> groups;
+        if (!fileComments.isEmpty()) {
+            QVector<Comment> currentGroup;
+            currentGroup.append(fileComments[0]);
+            
+            for (int i = 1; i < fileComments.size(); ++i) {
+                const Comment& prev = currentGroup.last();
+                const Comment& curr = fileComments[i];
+                
+                int gap = qMax(0, curr.startLine - prev.endLine - 1);
+                if (gap <= 2) {
+                    currentGroup.append(curr);
+                } else {
+                    groups.append(currentGroup);
+                    currentGroup.clear();
+                    currentGroup.append(curr);
+                }
+            }
+            if (!currentGroup.isEmpty()) {
+                groups.append(currentGroup);
+            }
+        }
+        
+        for (const auto& group : groups) {
+            bool hasSpecial = false;
+            for (const Comment& c : group) {
+                if (isSpecial(c)) {
+                    hasSpecial = true;
+                    break;
+                }
+            }
+            
+            if (hasSpecial) {
+                exportedGroupsCount++;
+                exportedCommentsCount += group.size();
+                
+                qDebug() << "Harvested Group in" << group.first().relativePath << "Lines:" << group.first().startLine << "-" << group.last().endLine;
+                for (const Comment& c : group) {
+                    qDebug() << "  * Line" << c.startLine << "(" << c.typeString() << "):" << c.cleanText;
+                }
+                
+                // Assert that the group is not empty and has a valid file path
+                QVERIFY(!group.isEmpty());
+                QVERIFY(!group.first().relativePath.isEmpty());
+            }
+        }
+    }
+    
+    // We expect to find special comment groups in all 4 files
+    QVERIFY(exportedGroupsCount >= 4);
 }
 
 QTEST_MAIN(TestCommentExtractor)

@@ -95,7 +95,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 
-project(CommentExplorer VERSION 1.1.0 LANGUAGES CXX C)
+project(CommentExplorer VERSION 1.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

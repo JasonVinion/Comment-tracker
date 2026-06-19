@@ -23,6 +23,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QDateTime>
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -177,6 +178,9 @@ void MainWindow::setupMenuBar() {
     QAction* exportAction = fileMenu->addAction("&Export Comments...");
     connect(exportAction, &QAction::triggered, this, &MainWindow::onExportComments);
     
+    QAction* harvestAction = fileMenu->addAction("&Harvest Special Comments...");
+    connect(harvestAction, &QAction::triggered, this, &MainWindow::onHarvestSpecialComments);
+    
     QAction* exportLogAction = fileMenu->addAction("Export Audit &Log...");
     connect(exportLogAction, &QAction::triggered, this, &MainWindow::onExportAuditLog);
     
@@ -219,6 +223,11 @@ void MainWindow::setupToolBar() {
 
     m_settingsBtn = new QPushButton("Settings");
     toolbar->addWidget(m_settingsBtn);
+    
+    m_harvestBtn = new QPushButton("Harvest Comments");
+    m_harvestBtn->setEnabled(false);
+    toolbar->addWidget(m_harvestBtn);
+    connect(m_harvestBtn, &QPushButton::clicked, this, &MainWindow::onHarvestSpecialComments);
     
     m_cancelBtn = new QPushButton("Cancel");
     m_cancelBtn->setEnabled(false);
@@ -803,4 +812,157 @@ void MainWindow::updateActionStates() {
     m_previewBtn->setEnabled(hasSelection);
     m_applyBtn->setEnabled(hasPending);
     m_discardBtn->setEnabled(hasPending);
+    m_harvestBtn->setEnabled(hasComments);
+}
+
+void MainWindow::onHarvestSpecialComments() {
+    if (m_commentModel->totalCount() == 0) {
+        QMessageBox::information(this, "No Comments", "There are no comments scanned yet. Please select a folder and scan first.");
+        return;
+    }
+    
+    QString fileName = QFileDialog::getSaveFileName(this, "Harvest Special Comments",
+        QDir::homePath() + "/special_comments_harvest.txt", "Text Files (*.txt);;All Files (*)");
+    
+    if (fileName.isEmpty()) {
+        return;
+    }
+    
+    QFile file(fileName);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Export Error", "Could not open file for writing.");
+        return;
+    }
+    
+    QTextStream out(&file);
+    
+    // Group comments by file path
+    QMap<QString, QVector<Comment>> commentsByFile;
+    const auto& allComments = m_commentModel->comments();
+    for (const Comment& c : allComments) {
+        commentsByFile[c.filePath].append(c);
+    }
+    
+    // Define special keywords list
+    static const QStringList matchTerms = {
+        "todo", "fix", "hack", "fix later", 
+        "partial implmentation", "partial implementation",
+        "simple implmentation", "simple implementation",
+        "example", "do later", "unstable",
+        "xxx", "bug", "deprecated", "warning", "optimize", "review"
+    };
+    
+    auto isSpecial = [](const Comment& comment) -> bool {
+        QString cleanTextLower = comment.cleanText.toLower();
+        QString rawTextLower = comment.rawText.toLower();
+        
+        for (const QString& term : matchTerms) {
+            if (cleanTextLower.contains(term) || rawTextLower.contains(term)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    
+    int exportedGroupsCount = 0;
+    int exportedCommentsCount = 0;
+    
+    out << "================================================================================\n";
+    out << "COMMENT TRACKER - SPECIAL COMMENTS HARVEST REPORT\n";
+    out << "Generated on: " << QDateTime::currentDateTime().toString(Qt::ISODate) << "\n";
+    out << "Keywords searched: " << matchTerms.join(", ") << "\n";
+    out << "================================================================================\n\n";
+    
+    for (auto it = commentsByFile.begin(); it != commentsByFile.end(); ++it) {
+        QVector<Comment> fileComments = it.value();
+        
+        // Sort by start line
+        std::sort(fileComments.begin(), fileComments.end(), [](const Comment& a, const Comment& b) {
+            if (a.startLine != b.startLine) {
+                return a.startLine < b.startLine;
+            }
+            return a.startColumn < b.startColumn;
+        });
+        
+        // Partition comments into groups where the gap between consecutive comments is <= 2 lines
+        QVector<QVector<Comment>> groups;
+        if (!fileComments.isEmpty()) {
+            QVector<Comment> currentGroup;
+            currentGroup.append(fileComments[0]);
+            
+            for (int i = 1; i < fileComments.size(); ++i) {
+                const Comment& prev = currentGroup.last();
+                const Comment& curr = fileComments[i];
+                
+                // Gap in lines
+                int gap = qMax(0, curr.startLine - prev.endLine - 1);
+                if (gap <= 2) {
+                    currentGroup.append(curr);
+                } else {
+                    groups.append(currentGroup);
+                    currentGroup.clear();
+                    currentGroup.append(curr);
+                }
+            }
+            if (!currentGroup.isEmpty()) {
+                groups.append(currentGroup);
+            }
+        }
+        
+        // Export groups that contain at least one special comment
+        for (const auto& group : groups) {
+            bool hasSpecial = false;
+            for (const Comment& c : group) {
+                if (isSpecial(c)) {
+                    hasSpecial = true;
+                    break;
+                }
+            }
+            
+            if (!hasSpecial) {
+                continue;
+            }
+            
+            exportedGroupsCount++;
+            exportedCommentsCount += group.size();
+            
+            const Comment& firstC = group.first();
+            const Comment& lastC = group.last();
+            
+            out << "--------------------------------------------------------------------------------\n";
+            out << "FILE: " << firstC.relativePath << " (" << firstC.language << ")\n";
+            out << "LINE RANGE: " << firstC.startLine << " - " << lastC.endLine << "\n";
+            out << "--------------------------------------------------------------------------------\n";
+            
+            if (!firstC.contextBefore.isEmpty()) {
+                out << "--- CODE CONTEXT BEFORE ---\n";
+                out << firstC.contextBefore << "\n\n";
+            }
+            
+            out << "--- COMMENTS ---\n";
+            for (const Comment& c : group) {
+                QString matchedIndicator = isSpecial(c) ? " [MATCH]" : " [CONTEXT COMMENT]";
+                out << "[Line " << c.startLine << " - " << c.endLine << " | Type: " << c.typeString() << "]" << matchedIndicator << "\n";
+                out << c.rawText << "\n\n";
+            }
+            
+            if (!lastC.contextAfter.isEmpty()) {
+                out << "--- CODE CONTEXT AFTER ---\n";
+                out << lastC.contextAfter << "\n";
+            }
+            
+            out << "\n";
+        }
+    }
+    
+    out << "================================================================================\n";
+    out << "SUMMARY:\n";
+    out << "Total special comment groups harvested: " << exportedGroupsCount << "\n";
+    out << "Total comments included (matching + surrounding): " << exportedCommentsCount << "\n";
+    out << "================================================================================\n";
+    
+    file.close();
+    m_statusLabel->setText(QString("Harvested %1 comments into %2").arg(exportedCommentsCount).arg(fileName));
+    QMessageBox::information(this, "Harvest Complete", 
+        QString("Successfully harvested %1 comments (including context) into:\n%2").arg(exportedCommentsCount).arg(fileName));
 }

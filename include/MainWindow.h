@@ -76,6 +76,7 @@ private slots:
     // Menu actions
     void onSettings();
     void onExportComments();
+    void onHarvestSpecialComments();
     void onExportAuditLog();
     void onAbout();
     
@@ -116,6 +117,7 @@ private:
     QPushButton* m_selectFolderBtn;
     QPushButton* m_rescanBtn;
     QPushButton* m_settingsBtn;
+    QPushButton* m_harvestBtn;
     QPushButton* m_cancelBtn;
     QLineEdit* m_searchEdit;
     QComboBox* m_keywordFilterCombo;
