@@ -1,572 +1,137 @@
 #include "LanguageRegistry.h"
-#include <QFileInfo>
+#include <algorithm>
 
-LanguageRegistry& LanguageRegistry::instance() {
-    static LanguageRegistry instance;
-    return instance;
+namespace {
+const QStringList kSlash = {"//"};
+const QStringList kHash = {"#"};
+const QVector<Delimiter> kCBlock = {{"/*", "*/"}};
+const QStringList kJavaDoc = {"/**"};
+const QVector<Delimiter> kQuotes = {"\"", "'"};
+const QVector<Delimiter> kDouble = {"\""};
+
+// Every entry: name, extensions, filenames, line markers, blocks, doc lines, doc blocks, strings, flags.
+QVector<LanguageConfig> defaultLanguages() {
+    return {
+        {.name = "C/C++", .extensions = {"c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "c++", "h++", "ino"},
+         .lineMarkers = kSlash, .blocks = kCBlock, .docLineMarkers = {"///"}, .docBlockStarts = kJavaDoc,
+         .strings = kQuotes, .cppRawStrings = true},
+        {.name = "C#", .extensions = {"cs"}, .lineMarkers = kSlash, .blocks = kCBlock, .docLineMarkers = {"///"},
+         .docBlockStarts = kJavaDoc, .strings = kQuotes},
+        {.name = "Java", .extensions = {"java"}, .lineMarkers = kSlash, .blocks = kCBlock, .docBlockStarts = kJavaDoc,
+         .strings = {"\"\"\"", "\"", "'"}},
+        {.name = "Kotlin", .extensions = {"kt", "kts"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docBlockStarts = kJavaDoc, .strings = {"\"\"\"", "\"", "'"}, .nestedBlocks = true},
+        {.name = "JavaScript", .extensions = {"js", "jsx", "mjs", "cjs"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docBlockStarts = kJavaDoc, .strings = {"\"", "'", "`"}, .regexLiterals = true},
+        {.name = "TypeScript", .extensions = {"ts", "tsx", "mts", "cts"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docBlockStarts = kJavaDoc, .strings = {"\"", "'", "`"}, .regexLiterals = true},
+        {.name = "JSONC", .extensions = {"jsonc", "json"}, .lineMarkers = kSlash, .blocks = kCBlock, .strings = kDouble},
+        {.name = "Python", .extensions = {"py", "pyw", "pyi"}, .lineMarkers = kHash,
+         .blocks = {"\"\"\"", "'''"}, .docBlockStarts = {"\"\"\"", "'''"},
+         .strings = {"\"\"\"", "'''", "\"", "'"}, .blocksAtLineStart = true},
+        {.name = "Lua", .extensions = {"lua"}, .lineMarkers = {"--"}, .blocks = {{"--[[", "]]"}},
+         .strings = {"\"", "'", {"[[", "]]"}}},
+        {.name = "Go", .extensions = {"go"}, .lineMarkers = kSlash, .blocks = kCBlock, .strings = {"\"", "'", "`"}},
+        {.name = "Rust", .extensions = {"rs"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docLineMarkers = {"///", "//!"}, .docBlockStarts = {"/**", "/*!"}, .strings = kQuotes, .nestedBlocks = true},
+        {.name = "PHP", .extensions = {"php", "phtml", "php3", "php4", "php5", "phps"}, .lineMarkers = {"//", "#"},
+         .blocks = kCBlock, .docBlockStarts = kJavaDoc, .strings = kQuotes},
+        {.name = "Ruby", .extensions = {"rb", "rake", "gemspec"}, .filenames = {"rakefile", "gemfile"},
+         .lineMarkers = kHash, .blocks = {{"=begin", "=end"}}, .strings = kQuotes, .blocksAtLineStart = true},
+        {.name = "Swift", .extensions = {"swift"}, .lineMarkers = kSlash, .blocks = kCBlock, .docLineMarkers = {"///"},
+         .docBlockStarts = kJavaDoc, .strings = {"\"\"\"", "\""}, .nestedBlocks = true},
+        {.name = "Shell", .extensions = {"sh", "bash", "zsh", "fish", "ksh"}, .lineMarkers = kHash,
+         .strings = kQuotes, .markerNeedsSpace = true},
+        {.name = "PowerShell", .extensions = {"ps1", "psm1", "psd1"}, .lineMarkers = kHash,
+         .blocks = {{"<#", "#>"}}, .strings = kQuotes},
+        {.name = "SQL", .extensions = {"sql"}, .lineMarkers = {"--"}, .blocks = kCBlock, .strings = kQuotes},
+        {.name = "HTML", .extensions = {"html", "htm", "xhtml", "vue", "svelte"}, .blocks = {{"<!--", "-->"}},
+         .strings = kQuotes},
+        {.name = "CSS", .extensions = {"css", "scss", "sass", "less"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .strings = kQuotes, .markerNeedsSpace = true},  // keeps url(http://...) intact
+        {.name = "XML", .extensions = {"xml", "xsl", "xslt", "svg", "xaml", "csproj", "props", "targets"},
+         .blocks = {{"<!--", "-->"}}, .strings = kQuotes},
+        {.name = "YAML", .extensions = {"yml", "yaml"}, .lineMarkers = kHash, .strings = kQuotes,
+         .markerNeedsSpace = true},
+        {.name = "Markdown", .extensions = {"md", "markdown"}, .blocks = {{"<!--", "-->"}}},
+        {.name = "Perl", .extensions = {"pl", "pm", "pod"}, .lineMarkers = kHash, .blocks = {{"=pod", "=cut"}},
+         .strings = kQuotes, .blocksAtLineStart = true},
+        {.name = "R", .extensions = {"r", "rmd"}, .lineMarkers = kHash, .strings = kQuotes},
+        {.name = "Scala", .extensions = {"scala", "sc"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docBlockStarts = kJavaDoc, .strings = {"\"\"\"", "\"", "'"}, .nestedBlocks = true},
+        {.name = "Objective-C", .extensions = {"m", "mm"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .docLineMarkers = {"///"}, .docBlockStarts = kJavaDoc, .strings = kQuotes},
+        {.name = "Haskell", .extensions = {"hs", "lhs"}, .lineMarkers = {"--"}, .blocks = {{"{-", "-}"}},
+         .docBlockStarts = {"{-|"}, .strings = kDouble, .nestedBlocks = true},
+        {.name = "Clojure", .extensions = {"clj", "cljs", "cljc", "edn"}, .lineMarkers = {";"}, .strings = kDouble},
+        {.name = "Erlang", .extensions = {"erl", "hrl"}, .lineMarkers = {"%"}, .strings = kDouble},
+        {.name = "Elixir", .extensions = {"ex", "exs"}, .lineMarkers = kHash, .strings = {"\"\"\"", "\"", "'"}},
+        {.name = "F#", .extensions = {"fs", "fsi", "fsx"}, .lineMarkers = kSlash, .blocks = {{"(*", "*)"}},
+         .docLineMarkers = {"///"}, .strings = {"\"\"\"", "\""}, .nestedBlocks = true},
+        {.name = "Visual Basic", .extensions = {"vb", "vbs"}, .lineMarkers = {"'"}, .docLineMarkers = {"'''"},
+         .strings = kDouble},
+        {.name = "Groovy", .extensions = {"groovy", "gvy", "gy", "gsh"}, .filenames = {"jenkinsfile"},
+         .lineMarkers = kSlash, .blocks = kCBlock, .docBlockStarts = kJavaDoc,
+         .strings = {"\"\"\"", "'''", "\"", "'"}},
+        {.name = "Dart", .extensions = {"dart"}, .lineMarkers = kSlash, .blocks = kCBlock, .docLineMarkers = {"///"},
+         .docBlockStarts = kJavaDoc, .strings = {"\"\"\"", "'''", "\"", "'"}, .nestedBlocks = true},
+        {.name = "Julia", .extensions = {"jl"}, .lineMarkers = kHash, .blocks = {{"#=", "=#"}},
+         .strings = {"\"\"\"", "\""}, .nestedBlocks = true},
+        {.name = "Assembly", .extensions = {"asm", "s"}, .lineMarkers = {";", "#"}, .strings = kQuotes},
+        {.name = "TOML", .extensions = {"toml"}, .lineMarkers = kHash, .strings = {"\"\"\"", "'''", "\"", "'"}},
+        {.name = "INI", .extensions = {"ini", "cfg", "conf"}, .lineMarkers = {";", "#"}},
+        {.name = "Makefile", .extensions = {"mk", "mak"}, .filenames = {"makefile", "gnumakefile"},
+         .lineMarkers = kHash},
+        {.name = "CMake", .extensions = {"cmake"}, .filenames = {"cmakelists.txt"}, .lineMarkers = kHash,
+         .blocks = {{"#[[", "]]"}}, .strings = kDouble},
+        {.name = "Dockerfile", .extensions = {"dockerfile"}, .filenames = {"dockerfile", "containerfile"},
+         .lineMarkers = kHash},
+        {.name = "Terraform", .extensions = {"tf", "tfvars", "hcl"}, .lineMarkers = {"#", "//"}, .blocks = kCBlock,
+         .strings = kDouble},
+        {.name = "Protocol Buffers", .extensions = {"proto"}, .lineMarkers = kSlash, .blocks = kCBlock,
+         .strings = kQuotes},
+    };
+}
+
+QString lowerSuffixAfter(QStringView s, QChar sep) {
+    const qsizetype i = s.lastIndexOf(sep);
+    return i < 0 ? QString() : s.mid(i + 1).toString().toLower();
+}
+} // namespace
+
+const LanguageRegistry& LanguageRegistry::instance() {
+    static const LanguageRegistry registry;
+    return registry;
 }
 
 LanguageRegistry::LanguageRegistry() {
-    initializeDefaultLanguages();
+    const auto longestFirst = [](const auto& a, const auto& b) { return a.size() > b.size(); };
+    for (LanguageConfig& cfg : defaultLanguages()) {
+        // Longer tokens must be tried first ("\"\"\"" before "\"", "--[[" before "--").
+        std::stable_sort(cfg.lineMarkers.begin(), cfg.lineMarkers.end(), longestFirst);
+        std::stable_sort(cfg.docLineMarkers.begin(), cfg.docLineMarkers.end(), longestFirst);
+        std::stable_sort(cfg.strings.begin(), cfg.strings.end(),
+                         [](const Delimiter& a, const Delimiter& b) { return a.start.size() > b.start.size(); });
+        const LanguageConfig* p = &m_languages.emplace_back(std::move(cfg));
+        m_byName.insert(p->name, p);
+        for (const QString& ext : p->extensions) m_byExtension.insert(ext.toLower(), p);
+        for (const QString& file : p->filenames) m_byFilename.insert(file.toLower(), p);
+    }
 }
 
-void LanguageRegistry::registerLanguage(const LanguageConfig& config) {
-    m_languagesByName[config.name] = config;
-    for (const QString& ext : config.extensions) {
-        m_extensionToLanguage[ext.toLower()] = config.name;
-    }
-    for (const QString& filename : config.filenames) {
-        m_filenameToLanguage[filename.toLower()] = config.name;
-    }
+const LanguageConfig* LanguageRegistry::byExtension(QString extension) const {
+    if (extension.startsWith('.')) extension.remove(0, 1);
+    return m_byExtension.value(extension.toLower());
 }
 
-const LanguageConfig* LanguageRegistry::getLanguageByExtension(const QString& extension) const {
-    QString ext = extension.toLower();
-    if (ext.startsWith('.')) {
-        ext = ext.mid(1);
-    }
-    auto it = m_extensionToLanguage.find(ext);
-    if (it != m_extensionToLanguage.end()) {
-        auto langIt = m_languagesByName.find(it.value());
-        if (langIt != m_languagesByName.end()) {
-            return &langIt.value();
-        }
-    }
-    return nullptr;
+const LanguageConfig* LanguageRegistry::byPath(QStringView path) const {
+    const QStringView name = path.mid(std::max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1);
+    if (const LanguageConfig* cfg = m_byFilename.value(name.toString().toLower())) return cfg;
+    return m_byExtension.value(lowerSuffixAfter(name, '.'));
 }
 
-const LanguageConfig* LanguageRegistry::getLanguageByPath(const QString& filePath) const {
-    QFileInfo fi(filePath);
-    
-    // First try extension-based lookup
-    const LanguageConfig* config = getLanguageByExtension(fi.suffix());
-    if (config) {
-        return config;
-    }
-    
-    // Fall back to filename-based lookup for extension-less files (e.g., Makefile, Dockerfile)
-    QString filename = fi.fileName().toLower();
-    auto it = m_filenameToLanguage.find(filename);
-    if (it != m_filenameToLanguage.end()) {
-        auto langIt = m_languagesByName.find(it.value());
-        if (langIt != m_languagesByName.end()) {
-            return &langIt.value();
-        }
-    }
-    
-    // Also try completeSuffix for files like CMakeLists.txt
-    QString completeSuffix = fi.completeSuffix().toLower();
-    if (!completeSuffix.isEmpty() && completeSuffix != fi.suffix().toLower()) {
-        config = getLanguageByExtension(completeSuffix);
-        if (config) {
-            return config;
-        }
-    }
-    
-    return nullptr;
-}
-
-bool LanguageRegistry::isSupported(const QString& extension) const {
-    QString ext = extension.toLower();
-    if (ext.startsWith('.')) {
-        ext = ext.mid(1);
-    }
-    return m_extensionToLanguage.contains(ext);
-}
-
-QStringList LanguageRegistry::getLanguageNames() const {
-    return m_languagesByName.keys();
-}
-
-QStringList LanguageRegistry::getAllExtensions() const {
-    return m_extensionToLanguage.keys();
-}
-
-QStringList LanguageRegistry::getExtensionsForLanguage(const QString& languageName) const {
-    auto it = m_languagesByName.find(languageName);
-    if (it != m_languagesByName.end()) {
-        return it.value().extensions;
-    }
-    return {};
-}
-
-void LanguageRegistry::initializeDefaultLanguages() {
-    // C/C++
-    {
-        LanguageConfig config;
-        config.name = "C/C++";
-        config.extensions = {"c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "c++", "h++"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docLineMarkers = {"///"};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        // R" matches start of raw strings; skipRawString() then parses "R\"delim(...)delim\""
-        config.rawStringMarkers = {"R\""};
-        registerLanguage(config);
-    }
-    
-    // C#
-    {
-        LanguageConfig config;
-        config.name = "C#";
-        config.extensions = {"cs"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docLineMarkers = {"///"};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Java
-    {
-        LanguageConfig config;
-        config.name = "Java";
-        config.extensions = {"java"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Kotlin
-    {
-        LanguageConfig config;
-        config.name = "Kotlin";
-        config.extensions = {"kt", "kts"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // JavaScript/TypeScript
-    {
-        LanguageConfig config;
-        config.name = "JavaScript";
-        config.extensions = {"js", "jsx", "mjs", "cjs"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'", "`"};
-        config.hasRegexLiterals = true;
-        registerLanguage(config);
-    }
-    
-    {
-        LanguageConfig config;
-        config.name = "TypeScript";
-        config.extensions = {"ts", "tsx", "mts", "cts"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'", "`"};
-        config.hasRegexLiterals = true;
-        registerLanguage(config);
-    }
-    
-    // JSONC
-    {
-        LanguageConfig config;
-        config.name = "JSONC";
-        config.extensions = {"jsonc", "json"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
-
-    // Python
-    {
-        LanguageConfig config;
-        config.name = "Python";
-        config.extensions = {"py", "pyw", "pyi"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"\"\"\"", "\"\"\""}, {"'''", "'''"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Lua
-    {
-        LanguageConfig config;
-        config.name = "Lua";
-        config.extensions = {"lua"};
-        config.singleLineMarkers = {"--"};
-        config.blockDelimiters = {{"--[[", "]]"}};
-        config.stringDelimiters = {"\"", "'", "[["}; // Long strings
-        registerLanguage(config);
-    }
-    
-    // Go
-    {
-        LanguageConfig config;
-        config.name = "Go";
-        config.extensions = {"go"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"\"", "'", "`"};
-        registerLanguage(config);
-    }
-    
-    // Rust
-    {
-        LanguageConfig config;
-        config.name = "Rust";
-        config.extensions = {"rs"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docLineMarkers = {"///", "//!"};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // PHP
-    {
-        LanguageConfig config;
-        config.name = "PHP";
-        config.extensions = {"php", "phtml", "php3", "php4", "php5", "phps"};
-        config.singleLineMarkers = {"//", "#"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Ruby
-    {
-        LanguageConfig config;
-        config.name = "Ruby";
-        config.extensions = {"rb", "rake", "gemspec"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"=begin", "=end"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Swift
-    {
-        LanguageConfig config;
-        config.name = "Swift";
-        config.extensions = {"swift"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docLineMarkers = {"///"};
-        config.stringDelimiters = {"\""};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // Shell
-    {
-        LanguageConfig config;
-        config.name = "Shell";
-        config.extensions = {"sh", "bash", "zsh", "fish", "ksh"};
-        config.singleLineMarkers = {"#"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // PowerShell
-    {
-        LanguageConfig config;
-        config.name = "PowerShell";
-        config.extensions = {"ps1", "psm1", "psd1"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"<#", "#>"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // SQL
-    {
-        LanguageConfig config;
-        config.name = "SQL";
-        config.extensions = {"sql"};
-        config.singleLineMarkers = {"--"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"'", "\""};
-        registerLanguage(config);
-    }
-    
-    // HTML
-    {
-        LanguageConfig config;
-        config.name = "HTML";
-        config.extensions = {"html", "htm", "xhtml"};
-        config.blockDelimiters = {{"<!--", "-->"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // CSS
-    {
-        LanguageConfig config;
-        config.name = "CSS";
-        config.extensions = {"css", "scss", "sass", "less"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.singleLineMarkers = {"//"}; // For SCSS/LESS
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // XML
-    {
-        LanguageConfig config;
-        config.name = "XML";
-        config.extensions = {"xml", "xsl", "xslt", "svg"};
-        config.blockDelimiters = {{"<!--", "-->"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // YAML
-    {
-        LanguageConfig config;
-        config.name = "YAML";
-        config.extensions = {"yml", "yaml"};
-        config.singleLineMarkers = {"#"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Markdown
-    {
-        LanguageConfig config;
-        config.name = "Markdown";
-        config.extensions = {"md", "markdown"};
-        config.blockDelimiters = {{"<!--", "-->"}};
-        registerLanguage(config);
-    }
-    
-    // Perl
-    {
-        LanguageConfig config;
-        config.name = "Perl";
-        config.extensions = {"pl", "pm", "pod"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"=pod", "=cut"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // R
-    {
-        LanguageConfig config;
-        config.name = "R";
-        config.extensions = {"r", "R", "rmd"};
-        config.singleLineMarkers = {"#"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Scala
-    {
-        LanguageConfig config;
-        config.name = "Scala";
-        config.extensions = {"scala", "sc"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // Objective-C
-    {
-        LanguageConfig config;
-        config.name = "Objective-C";
-        config.extensions = {"m", "mm"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Haskell
-    {
-        LanguageConfig config;
-        config.name = "Haskell";
-        config.extensions = {"hs", "lhs"};
-        config.singleLineMarkers = {"--"};
-        config.blockDelimiters = {{"{-", "-}"}};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // Clojure
-    {
-        LanguageConfig config;
-        config.name = "Clojure";
-        config.extensions = {"clj", "cljs", "cljc", "edn"};
-        config.singleLineMarkers = {";"};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
-    
-    // Erlang
-    {
-        LanguageConfig config;
-        config.name = "Erlang";
-        config.extensions = {"erl", "hrl"};
-        config.singleLineMarkers = {"%"};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
-    
-    // Elixir
-    {
-        LanguageConfig config;
-        config.name = "Elixir";
-        config.extensions = {"ex", "exs"};
-        config.singleLineMarkers = {"#"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // F#
-    {
-        LanguageConfig config;
-        config.name = "F#";
-        config.extensions = {"fs", "fsi", "fsx"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"(*", "*)"}};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // Visual Basic
-    {
-        LanguageConfig config;
-        config.name = "Visual Basic";
-        config.extensions = {"vb", "vbs"};
-        config.singleLineMarkers = {"'"};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
-    
-    // Groovy
-    {
-        LanguageConfig config;
-        config.name = "Groovy";
-        config.extensions = {"groovy", "gvy", "gy", "gsh"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docBlockDelimiters = {{"/**", "*/"}};
-        config.stringDelimiters = {"\"", "'", "'''"};
-        registerLanguage(config);
-    }
-    
-    // Dart
-    {
-        LanguageConfig config;
-        config.name = "Dart";
-        config.extensions = {"dart"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.docLineMarkers = {"///"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // Julia
-    {
-        LanguageConfig config;
-        config.name = "Julia";
-        config.extensions = {"jl"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"#=", "=#"}};
-        config.stringDelimiters = {"\"", "'"};
-        config.supportsNestedComments = true;
-        registerLanguage(config);
-    }
-    
-    // Assembly
-    {
-        LanguageConfig config;
-        config.name = "Assembly";
-        config.extensions = {"asm", "s", "S"};
-        config.singleLineMarkers = {";", "#"};
-        config.stringDelimiters = {"\"", "'"};
-        registerLanguage(config);
-    }
-    
-    // TOML
-    {
-        LanguageConfig config;
-        config.name = "TOML";
-        config.extensions = {"toml"};
-        config.singleLineMarkers = {"#"};
-        config.stringDelimiters = {"\"", "'", "\"\"\""};
-        registerLanguage(config);
-    }
-    
-    // INI
-    {
-        LanguageConfig config;
-        config.name = "INI";
-        config.extensions = {"ini", "cfg", "conf"};
-        config.singleLineMarkers = {";", "#"};
-        registerLanguage(config);
-    }
-    
-    // Makefile
-    {
-        LanguageConfig config;
-        config.name = "Makefile";
-        config.extensions = {"mk", "mak"};
-        config.filenames = {"makefile", "gnumakefile"};
-        config.singleLineMarkers = {"#"};
-        registerLanguage(config);
-    }
-    
-    // CMake
-    {
-        LanguageConfig config;
-        config.name = "CMake";
-        config.extensions = {"cmake"};
-        config.filenames = {"cmakelists.txt"};
-        config.singleLineMarkers = {"#"};
-        config.blockDelimiters = {{"#[[", "]]"}};
-        registerLanguage(config);
-    }
-    
-    // Dockerfile
-    {
-        LanguageConfig config;
-        config.name = "Dockerfile";
-        config.filenames = {"dockerfile", "containerfile"};
-        config.singleLineMarkers = {"#"};
-        registerLanguage(config);
-    }
-    
-    // Terraform
-    {
-        LanguageConfig config;
-        config.name = "Terraform";
-        config.extensions = {"tf", "tfvars"};
-        config.singleLineMarkers = {"#", "//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
-    
-    // Protocol Buffers
-    {
-        LanguageConfig config;
-        config.name = "Protocol Buffers";
-        config.extensions = {"proto"};
-        config.singleLineMarkers = {"//"};
-        config.blockDelimiters = {{"/*", "*/"}};
-        config.stringDelimiters = {"\""};
-        registerLanguage(config);
-    }
+QStringList LanguageRegistry::languageNames() const {
+    QStringList names = m_byName.keys();
+    names.sort(Qt::CaseInsensitive);
+    return names;
 }

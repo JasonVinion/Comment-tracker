@@ -10,10 +10,10 @@ A Qt6 desktop application for exploring and safely removing code comments across
 
 - **30+ languages** — C/C++, C#, Java, Kotlin, JavaScript/TypeScript, Python, Go, Rust, PHP, Ruby, Swift, Shell, PowerShell, SQL, HTML, CSS, YAML, and more.
 - **Two extractors** — fast lexer (string/regex-aware) or Tree-sitter parser for full accuracy on supported grammars.
-- **Safe deletion** — synchronized before/after preview with syntax highlighting before anything is written.
+- **Safe deletion** — synchronized before/after preview with syntax highlighting before anything is written; code on the same line, line endings and BOMs are preserved, and files changed since the scan are never overwritten.
 - **Automatic backups** — every modified file is backed up under `.comment-explorer-backups/` by default.
 - **Keyword filtering** — surface TODO / FIXME / HACK / NOTE / etc. across the whole tree.
-- **Configurable ignores** — glob patterns and optional `.gitignore` honoring.
+- **Configurable ignores** — `.gitignore`-style patterns and optional `.gitignore` honoring (including nested files).
 - **Audit log** — every write is recorded.
 
 ## Install
@@ -50,6 +50,7 @@ On Linux:
 sudo apt install qt6-base-dev cmake build-essential
 cmake -B build -S .
 cmake --build build -j
+ctest --test-dir build
 ```
 
 ## Usage
@@ -83,9 +84,9 @@ src/            Implementation (Qt widgets, extractors, planner, writer)
 tests/          QtTest unit tests
 docs/           User-facing documentation
 installer/      Inno Setup script + packaging helper
-resources/      Icons, .qrc, Windows .rc
+resources/      Windows icon and .rc
 my-ports/       Custom vcpkg ports
-tools/          Build-time tooling (icon generator)
+test_examples/  Sample sources used by the tests
 ```
 
 ## License

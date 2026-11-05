@@ -1,283 +1,152 @@
 #include "DiffPreview.h"
 #include "SyntaxHighlighter.h"
-#include <QVBoxLayout>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QPainter>
-#include <QTextBlock>
 #include <QScrollBar>
-#include <QPalette>
+#include <QSplitter>
+#include <QTextBlock>
+#include <QVBoxLayout>
 
-// LineNumberArea implementation
+namespace {
+class LineNumberArea : public QWidget {
+public:
+    explicit LineNumberArea(CodeEditor* editor) : QWidget(editor), m_editor(editor) {}
+    QSize sizeHint() const override { return {m_editor->lineNumberAreaWidth(), 0}; }
 
-LineNumberArea::LineNumberArea(CodeEditor* editor)
-    : QWidget(editor)
-    , m_codeEditor(editor) {
+protected:
+    void paintEvent(QPaintEvent* event) override { m_editor->paintLineNumbers(event); }
+
+private:
+    CodeEditor* m_editor;
+};
+
+/// Blends a highlight colour into the editor background so it works in light and dark themes.
+QColor blend(const QColor& base, const QColor& color) {
+    constexpr double ratio = 0.35;
+    QColor c(int(base.red() + (color.red() - base.red()) * ratio), int(base.green() + (color.green() - base.green()) * ratio),
+             int(base.blue() + (color.blue() - base.blue()) * ratio));
+    c.setAlpha(200);
+    return c;
 }
-
-QSize LineNumberArea::sizeHint() const {
-    return QSize(m_codeEditor->lineNumberAreaWidth(), 0);
-}
-
-void LineNumberArea::paintEvent(QPaintEvent* event) {
-    m_codeEditor->lineNumberAreaPaintEvent(event);
-}
-
-// CodeEditor implementation
+} // namespace
 
 CodeEditor::CodeEditor(QWidget* parent)
-    : QPlainTextEdit(parent) {
-    m_lineNumberArea = new LineNumberArea(this);
-    
-    connect(this, &CodeEditor::blockCountChanged, this, &CodeEditor::updateLineNumberAreaWidth);
-    connect(this, &CodeEditor::updateRequest, this, &CodeEditor::updateLineNumberArea);
-    connect(this, &CodeEditor::cursorPositionChanged, this, &CodeEditor::highlightCurrentLine);
-    
-    updateLineNumberAreaWidth(0);
-    
-    // Set monospace font
-    QFont font("Consolas", 10);
+    : QPlainTextEdit(parent), m_lineNumberArea(new LineNumberArea(this)), m_highlighter(new SyntaxHighlighter(document())) {
+    QFont font(QStringLiteral("Consolas"), 10);
     font.setStyleHint(QFont::Monospace);
     setFont(font);
-    
-    // Set tab width
-    setTabStopDistance(4 * fontMetrics().horizontalAdvance(' '));
-    
-    // Read-only by default
+    setTabStopDistance(4 * fontMetrics().horizontalAdvance(u' '));
     setReadOnly(true);
-}
+    setLineWrapMode(QPlainTextEdit::NoWrap);
 
-int CodeEditor::lineNumberAreaWidth() {
-    int digits = 1;
-    int max = qMax(1, blockCount());
-    while (max >= 10) {
-        max /= 10;
-        ++digits;
-    }
-    
-    int space = 10 + fontMetrics().horizontalAdvance(QLatin1Char('9')) * digits;
-    return space;
-}
-
-void CodeEditor::updateLineNumberAreaWidth(int /* newBlockCount */) {
+    connect(this, &CodeEditor::blockCountChanged, this, [this] { setViewportMargins(lineNumberAreaWidth(), 0, 0, 0); });
+    connect(this, &CodeEditor::updateRequest, this, [this](const QRect& rect, int dy) {
+        if (dy) m_lineNumberArea->scroll(0, dy);
+        else m_lineNumberArea->update(0, rect.y(), m_lineNumberArea->width(), rect.height());
+    });
     setViewportMargins(lineNumberAreaWidth(), 0, 0, 0);
 }
 
-void CodeEditor::updateLineNumberArea(const QRect& rect, int dy) {
-    if (dy) {
-        m_lineNumberArea->scroll(0, dy);
-    } else {
-        m_lineNumberArea->update(0, rect.y(), m_lineNumberArea->width(), rect.height());
-    }
-    
-    if (rect.contains(viewport()->rect())) {
-        updateLineNumberAreaWidth(0);
-    }
+void CodeEditor::setContent(const QString& text, const QString& language) {
+    m_highlighter->setDocument(nullptr);  // highlight once, after the text is in place
+    setPlainText(text);
+    m_highlighter->setLanguage(language);
+    m_highlighter->setDocument(document());
 }
 
-void CodeEditor::resizeEvent(QResizeEvent* e) {
-    QPlainTextEdit::resizeEvent(e);
-    
-    QRect cr = contentsRect();
-    m_lineNumberArea->setGeometry(QRect(cr.left(), cr.top(), lineNumberAreaWidth(), cr.height()));
+int CodeEditor::lineNumberAreaWidth() const {
+    return 10 + fontMetrics().horizontalAdvance(u'9') * int(QString::number(qMax(1, blockCount())).size());
 }
 
-void CodeEditor::highlightCurrentLine() {
-    QList<QTextEdit::ExtraSelection> extraSelections;
-    
-    if (!isReadOnly()) {
-        QTextEdit::ExtraSelection selection;
-        
-        QColor lineColor = adjustedHighlightColor(QColor(Qt::yellow).lighter(160));
-        selection.format.setBackground(lineColor);
-        selection.format.setProperty(QTextFormat::FullWidthSelection, true);
-        selection.cursor = textCursor();
-        selection.cursor.clearSelection();
-        extraSelections.append(selection);
-    }
-    
-    // Add line highlights
-    for (const auto& [line, color] : m_lineHighlights) {
-        QTextBlock block = document()->findBlockByNumber(line - 1);
-        if (block.isValid()) {
-            QTextEdit::ExtraSelection selection;
-            selection.format.setBackground(adjustedHighlightColor(color));
-            selection.format.setProperty(QTextFormat::FullWidthSelection, true);
-            QTextCursor cursor(block);
-            cursor.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
-            selection.cursor = cursor;
-            extraSelections.append(selection);
-        }
-    }
-    
-    setExtraSelections(extraSelections);
+void CodeEditor::resizeEvent(QResizeEvent* event) {
+    QPlainTextEdit::resizeEvent(event);
+    const QRect cr = contentsRect();
+    m_lineNumberArea->setGeometry(cr.left(), cr.top(), lineNumberAreaWidth(), cr.height());
 }
 
-void CodeEditor::lineNumberAreaPaintEvent(QPaintEvent* event) {
+void CodeEditor::paintLineNumbers(QPaintEvent* event) {
     QPainter painter(m_lineNumberArea);
-    painter.fillRect(event->rect(), QColor(240, 240, 240));
-    
+    painter.fillRect(event->rect(), palette().color(QPalette::AlternateBase));
+    painter.setPen(palette().color(QPalette::PlaceholderText));
     QTextBlock block = firstVisibleBlock();
-    int blockNumber = block.blockNumber();
     int top = qRound(blockBoundingGeometry(block).translated(contentOffset()).top());
-    int bottom = top + qRound(blockBoundingRect(block).height());
-    
     while (block.isValid() && top <= event->rect().bottom()) {
-        if (block.isVisible() && bottom >= event->rect().top()) {
-            QString number = QString::number(blockNumber + 1);
-            painter.setPen(Qt::darkGray);
-            painter.drawText(0, top, m_lineNumberArea->width() - 5, fontMetrics().height(),
-                             Qt::AlignRight, number);
-        }
-        
+        const int bottom = top + qRound(blockBoundingRect(block).height());
+        if (block.isVisible() && bottom >= event->rect().top())
+            painter.drawText(0, top, m_lineNumberArea->width() - 5, fontMetrics().height(), Qt::AlignRight,
+                             QString::number(block.blockNumber() + 1));
         block = block.next();
         top = bottom;
-        bottom = top + qRound(blockBoundingRect(block).height());
-        ++blockNumber;
     }
 }
 
-void CodeEditor::highlightLines(int startLine, int endLine, const QColor& color) {
-    for (int line = startLine; line <= endLine; line++) {
-        m_lineHighlights.append({line, color});
+void CodeEditor::highlightLines(const QVector<QPair<int, int>>& ranges, const QColor& color) {
+    QList<QTextEdit::ExtraSelection> selections;
+    QTextEdit::ExtraSelection sel;
+    sel.format.setBackground(blend(palette().color(QPalette::Base), color));
+    sel.format.setProperty(QTextFormat::FullWidthSelection, true);
+    for (const auto& [first, last] : ranges) {
+        for (int line = first; line <= last; ++line) {  // full-width selections only span one block each
+            const QTextBlock block = document()->findBlockByNumber(line - 1);
+            if (!block.isValid()) break;
+            sel.cursor = QTextCursor(block);
+            selections << sel;
+        }
     }
-    highlightCurrentLine();
-}
-
-void CodeEditor::clearHighlights() {
-    m_lineHighlights.clear();
-    highlightCurrentLine();
-}
-
-QColor CodeEditor::adjustedHighlightColor(const QColor& color) const {
-    QColor base = palette().color(QPalette::Base);
-    constexpr qreal blendRatio = 0.35;
-    QColor blended(
-        static_cast<int>(base.red() + (color.red() - base.red()) * blendRatio),
-        static_cast<int>(base.green() + (color.green() - base.green()) * blendRatio),
-        static_cast<int>(base.blue() + (color.blue() - base.blue()) * blendRatio)
-    );
-    blended.setAlpha(200);
-    return blended;
+    setExtraSelections(selections);
 }
 
 void CodeEditor::scrollToLine(int line) {
-    QTextBlock block = document()->findBlockByNumber(line - 1);
-    if (block.isValid()) {
-        QTextCursor cursor(block);
-        setTextCursor(cursor);
-        centerCursor();
-    }
+    const QTextBlock block = document()->findBlockByNumber(qMax(0, line - 1));
+    if (!block.isValid()) return;
+    setTextCursor(QTextCursor(block));
+    centerCursor();
 }
 
-// DiffPreview implementation
-
-DiffPreview::DiffPreview(QWidget* parent)
-    : QWidget(parent) {
-    setupUI();
-}
-
-void DiffPreview::setupUI() {
-    QVBoxLayout* layout = new QVBoxLayout(this);
+DiffPreview::DiffPreview(QWidget* parent) : QWidget(parent) {
+    auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
-    
-    // Headers
-    QHBoxLayout* headerLayout = new QHBoxLayout();
-    QLabel* originalLabel = new QLabel("Current");
-    QLabel* modifiedLabel = new QLabel("After Deletion");
-    
-    QFont boldFont = originalLabel->font();
-    boldFont.setBold(true);
-    originalLabel->setFont(boldFont);
-    modifiedLabel->setFont(boldFont);
-    
-    originalLabel->setAlignment(Qt::AlignCenter);
-    modifiedLabel->setAlignment(Qt::AlignCenter);
-    
-    headerLayout->addWidget(originalLabel);
-    headerLayout->addWidget(modifiedLabel);
-    layout->addLayout(headerLayout);
-    
-    // Editors
-    m_splitter = new QSplitter(Qt::Horizontal, this);
-    
-    m_originalEditor = new CodeEditor(this);
-    m_modifiedEditor = new CodeEditor(this);
-    
-    m_originalHighlighter = new SyntaxHighlighter(m_originalEditor->document());
-    m_modifiedHighlighter = new SyntaxHighlighter(m_modifiedEditor->document());
-    
-    m_splitter->addWidget(m_originalEditor);
-    m_splitter->addWidget(m_modifiedEditor);
-    
-    layout->addWidget(m_splitter);
-    
-    // Sync scrolling
-    connect(m_originalEditor->verticalScrollBar(), &QScrollBar::valueChanged,
-            this, &DiffPreview::syncScroll);
-    connect(m_modifiedEditor->verticalScrollBar(), &QScrollBar::valueChanged,
-            this, &DiffPreview::syncScroll);
-}
-
-void DiffPreview::setOriginal(const QString& content, const QString& language) {
-    m_originalEditor->setPlainText(content);
-    m_originalHighlighter->setLanguage(language);
-}
-
-void DiffPreview::setModified(const QString& content) {
-    m_modifiedEditor->setPlainText(content);
-}
-
-void DiffPreview::setFromEditResult(const EditResult& result, const QString& language) {
-    setOriginal(result.originalContent, language);
-    setModified(result.modifiedContent);
-    m_modifiedHighlighter->setLanguage(language);
-    
-    highlightDiff(result);
-}
-
-void DiffPreview::highlightComment(const Comment& comment) {
-    m_originalEditor->clearHighlights();
-    m_modifiedEditor->clearHighlights();
-    m_originalEditor->highlightLines(comment.startLine, comment.endLine, QColor(255, 255, 200));
-    m_originalEditor->scrollToLine(comment.startLine);
-    m_modifiedEditor->scrollToLine(comment.startLine);
-}
-
-void DiffPreview::highlightDiff(const EditResult& result) {
-    m_originalEditor->clearHighlights();
-    
-    for (const auto& region : result.diffRegions) {
-        m_originalEditor->highlightLines(region.originalStart, region.originalEnd, QColor(255, 200, 200));
+    auto* splitter = new QSplitter(Qt::Horizontal, this);
+    for (auto [editor, title] : {std::pair{&m_original, tr("Current")}, std::pair{&m_modified, tr("After Deletion")}}) {
+        auto* pane = new QWidget;
+        auto* paneLayout = new QVBoxLayout(pane);
+        paneLayout->setContentsMargins(0, 0, 0, 0);
+        auto* label = new QLabel(QStringLiteral("<b>%1</b>").arg(title));
+        label->setAlignment(Qt::AlignCenter);
+        paneLayout->addWidget(label);
+        paneLayout->addWidget(*editor = new CodeEditor);
+        splitter->addWidget(pane);
     }
-    
-    if (!result.diffRegions.isEmpty()) {
-        m_originalEditor->scrollToLine(result.diffRegions.first().originalStart);
-    }
+    layout->addWidget(splitter);
+
+    auto sync = [this](CodeEditor* from, CodeEditor* to) {
+        connect(from->verticalScrollBar(), &QScrollBar::valueChanged, this, [this, to](int value) {
+            if (m_syncing) return;
+            m_syncing = true;
+            to->verticalScrollBar()->setValue(value);
+            m_syncing = false;
+        });
+    };
+    sync(m_original, m_modified);
+    sync(m_modified, m_original);
 }
 
-void DiffPreview::scrollToLine(int line) {
-    m_originalEditor->scrollToLine(line);
+void DiffPreview::showDiff(const QString& original, const QString& modified, const QString& language,
+                           const QVector<EditRange>& removed, int focusLine) {
+    m_syncing = true;
+    m_original->setContent(original, language);
+    m_modified->setContent(modified, language);
+    QVector<QPair<int, int>> lines;
+    for (const EditRange& r : removed) lines.append({r.startLine, r.endLine});
+    m_original->highlightLines(lines, QColor(255, 200, 200));
+    m_original->scrollToLine(focusLine);
+    m_modified->scrollToLine(focusLine);
+    m_syncing = false;
 }
 
 void DiffPreview::clear() {
-    m_originalEditor->clear();
-    m_modifiedEditor->clear();
-    m_originalEditor->clearHighlights();
-    m_modifiedEditor->clearHighlights();
-}
-
-void DiffPreview::syncScroll() {
-    if (m_syncingScroll) return;
-    
-    m_syncingScroll = true;
-    
-    QScrollBar* sender = qobject_cast<QScrollBar*>(QObject::sender());
-    if (sender == m_originalEditor->verticalScrollBar()) {
-        m_modifiedEditor->verticalScrollBar()->setValue(sender->value());
-    } else {
-        m_originalEditor->verticalScrollBar()->setValue(sender->value());
+    for (CodeEditor* editor : {m_original, m_modified}) {
+        editor->setExtraSelections({});
+        editor->clear();
     }
-    
-    m_syncingScroll = false;
 }

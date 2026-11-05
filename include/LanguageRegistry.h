@@ -1,110 +1,50 @@
 #ifndef LANGUAGE_REGISTRY_H
 #define LANGUAGE_REGISTRY_H
 
+#include <QHash>
 #include <QString>
-#include <QMap>
 #include <QStringList>
-#include <QRegularExpression>
-#include <memory>
+#include <QVector>
+#include <deque>
 
-/**
- * @brief Defines how comments are structured in a programming language
- */
-struct LanguageConfig {
-    QString name;                      // Human-readable name
-    QStringList extensions;            // File extensions (without dot)
-    QStringList filenames;             // Exact filename matches (e.g., "Makefile", "Dockerfile")
-    
-    // Single-line comment markers
-    QStringList singleLineMarkers;     // e.g., "//", "#"
-    
-    // Multi-line comment delimiters
-    struct BlockDelimiter {
-        QString start;                 // e.g., "/*"
-        QString end;                   // e.g., "*/"
-    };
-    QVector<BlockDelimiter> blockDelimiters;
-    
-    // Doc comment markers (subset of above, for special handling)
-    QStringList docLineMarkers;        // e.g., "///"
-    QVector<BlockDelimiter> docBlockDelimiters; // e.g., "/**" ... "*/"
-    
-    // String delimiters (to avoid false positives)
-    QStringList stringDelimiters;      // e.g., "\"", "'"
-    QStringList rawStringMarkers;      // e.g., R" for C++
-    
-    // Regex literals (for languages like JavaScript)
-    bool hasRegexLiterals = false;
-    
-    // Nested comments support
-    bool supportsNestedComments = false;
-    
-    // Whether the language is supported by parser (vs regex fallback)
-    bool parserSupported = false;
+/// A start/end token pair. A single token means start == end (e.g. a quote).
+struct Delimiter {
+    QString start, end;
+    Delimiter(const char* s) : start(QString::fromLatin1(s)), end(start) {}
+    Delimiter(const char* s, const char* e) : start(QString::fromLatin1(s)), end(QString::fromLatin1(e)) {}
 };
 
-/**
- * @brief Registry mapping file extensions to language configurations
- * 
- * This class provides a central registry of programming languages and their
- * comment syntax. It's designed to be extensible without modifying the core
- * parsing pipeline.
- */
+/// Comment and string syntax of one language.
+struct LanguageConfig {
+    QString name;
+    QStringList extensions;              // lower-case, without dot
+    QStringList filenames;               // exact (lower-case) names, e.g. "makefile"
+    QStringList lineMarkers;             // "//", "#"
+    QVector<Delimiter> blocks;           // "/*" ... "*/"
+    QStringList docLineMarkers;          // "///"
+    QStringList docBlockStarts;          // "/**"
+    QVector<Delimiter> strings;          // "\"", "'", {"[[", "]]"}
+    bool cppRawStrings = false;          // R"delim(...)delim"
+    bool regexLiterals = false;          // JavaScript-style /re/
+    bool nestedBlocks = false;           // /* /* */ */
+    bool blocksAtLineStart = false;      // blocks only count when first on a line (docstrings, =begin)
+    bool markerNeedsSpace = false;       // line markers only count after whitespace (shell $#, CSS url(//))
+};
+
+/// Central, immutable table of supported languages.
 class LanguageRegistry {
 public:
-    /**
-     * @brief Get the singleton instance
-     */
-    static LanguageRegistry& instance();
-    
-    /**
-     * @brief Register a new language configuration
-     */
-    void registerLanguage(const LanguageConfig& config);
-    
-    /**
-     * @brief Get the language configuration for a file extension
-     * @param extension File extension without dot (e.g., "cpp")
-     * @return Language config or nullptr if not found
-     */
-    const LanguageConfig* getLanguageByExtension(const QString& extension) const;
-    
-    /**
-     * @brief Get the language configuration for a file path
-     * @param filePath Full or relative file path
-     * @return Language config or nullptr if not found
-     */
-    const LanguageConfig* getLanguageByPath(const QString& filePath) const;
-    
-    /**
-     * @brief Check if a file extension is registered
-     */
-    bool isSupported(const QString& extension) const;
-    
-    /**
-     * @brief Get all registered language names
-     */
-    QStringList getLanguageNames() const;
-    
-    /**
-     * @brief Get all registered extensions
-     */
-    QStringList getAllExtensions() const;
-    
-    /**
-     * @brief Get extensions for a specific language
-     */
-    QStringList getExtensionsForLanguage(const QString& languageName) const;
-    
+    static const LanguageRegistry& instance();
+
+    const LanguageConfig* byName(const QString& name) const { return m_byName.value(name); }
+    const LanguageConfig* byExtension(QString extension) const;
+    const LanguageConfig* byPath(QStringView path) const;
+    QStringList languageNames() const;
+
 private:
     LanguageRegistry();
-    ~LanguageRegistry() = default;
-    
-    void initializeDefaultLanguages();
-    
-    QMap<QString, LanguageConfig> m_languagesByName;
-    QMap<QString, QString> m_extensionToLanguage; // extension -> language name
-    QMap<QString, QString> m_filenameToLanguage;  // filename -> language name
+    std::deque<LanguageConfig> m_languages;  // deque keeps element addresses stable
+    QHash<QString, const LanguageConfig*> m_byName, m_byExtension, m_byFilename;
 };
 
 #endif // LANGUAGE_REGISTRY_H

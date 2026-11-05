@@ -1,858 +1,296 @@
 #include "CommentExtractor.h"
-#include <QFile>
-#include <QTextStream>
-#include <QRegularExpression>
+#include "LanguageRegistry.h"
+#include "TextFile.h"
 #include <tree_sitter/api.h>
+#include <atomic>
+#include <cstring>
+#include <memory>
 
 extern "C" {
-    const TSLanguage *tree_sitter_json(void);
-    const TSLanguage *tree_sitter_cpp(void);
-    const TSLanguage *tree_sitter_python(void);
-    const TSLanguage *tree_sitter_javascript(void);
+const TSLanguage* tree_sitter_json(void);
+const TSLanguage* tree_sitter_cpp(void);
+const TSLanguage* tree_sitter_python(void);
+const TSLanguage* tree_sitter_javascript(void);
 }
 
-const QStringList CommentExtractor::DEFAULT_KEYWORDS = {
-    "TODO",
-    "FIXME",
-    "XXX",
-    "HACK",
-    "NOTE",
-    "BUG",
-    "OPTIMIZE",
-    "REVIEW",
-    "WARNING",
-    "DEPRECATED"
+namespace {
+std::atomic<int> g_nextCommentId{1};
+
+const TSLanguage* grammarFor(const QString& language) {
+    if (language == u"JSONC") return tree_sitter_json();
+    if (language == u"C/C++") return tree_sitter_cpp();
+    if (language == u"Python") return tree_sitter_python();
+    if (language == u"JavaScript" || language == u"TypeScript") return tree_sitter_javascript();
+    return nullptr;
+}
+
+struct ParserDeleter { void operator()(TSParser* p) const { ts_parser_delete(p); } };
+struct TreeDeleter { void operator()(TSTree* t) const { ts_tree_delete(t); } };
+
+bool isTsComment(const char* type) {
+    return !std::strcmp(type, "comment") || !std::strcmp(type, "line_comment") || !std::strcmp(type, "block_comment");
+}
+} // namespace
+
+struct CommentExtractor::Context {
+    const QString& text;
+    const LanguageConfig& cfg;
+    const QString& filePath;
+    const QString& relativePath;
+    LineIndex lines;
+    QVector<Comment> out;
 };
 
-CommentExtractor::CommentExtractor(QObject* parent)
-    : QObject(parent)
-    , m_keywords(DEFAULT_KEYWORDS) {
+QStringList CommentExtractor::defaultKeywords() {
+    return {"TODO", "FIXME", "XXX", "HACK", "NOTE", "BUG", "OPTIMIZE", "REVIEW", "WARNING", "DEPRECATED"};
 }
+
+CommentExtractor::CommentExtractor() { setKeywords(defaultKeywords()); }
 
 void CommentExtractor::setKeywords(const QStringList& keywords) {
     m_keywords = keywords;
+    QStringList escaped;
+    for (const QString& k : keywords)
+        if (!k.trimmed().isEmpty()) escaped << QRegularExpression::escape(k.trimmed());
+    m_keywordRegex = QRegularExpression(escaped.isEmpty() ? QString() : "\\b(?:" + escaped.join('|') + ")\\b",
+                                        QRegularExpression::CaseInsensitiveOption);
+    m_keywordRegex.optimize();
 }
 
-QVector<Comment> CommentExtractor::extractFromFile(const QString& filePath, const QString& relativePath) {
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        emit error(filePath, "Cannot open file: " + file.errorString());
-        return {};
-    }
-    
-    QTextStream in(&file);
-    in.setEncoding(QStringConverter::Utf8);
-    QString content;
-    try {
-        content = in.readAll();
-    } catch (...) {
-        emit error(filePath, "Failed to read file content");
-        file.close();
-        return {};
-    }
-    file.close();
-    
-    // Handle empty files
-    if (content.isEmpty()) {
-        return {};
-    }
-    
-    // Get language config
-    const LanguageConfig* config = LanguageRegistry::instance().getLanguageByPath(filePath);
-    if (!config) {
-        emit error(filePath, "Unsupported file type");
-        return {};
-    }
-    
-    QVector<Comment> comments;
-    try {
-        if (m_parserMethod == ParserMethod::TreeSitter) {
-            comments = extractWithTreeSitter(content, *config, filePath, relativePath);
-        } else {
-            comments = extractWithLexer(content, *config, filePath, relativePath);
-        }
-    } catch (const std::exception& e) {
-        emit error(filePath, QString("Extraction failed: %1").arg(e.what()));
-        return {};
-    } catch (...) {
-        emit error(filePath, "Extraction failed with unknown error");
-        return {};
-    }
-    
-    emit fileProcessed(filePath, comments.size());
-    return comments;
+QVector<Comment> CommentExtractor::extractFromFile(const QString& filePath, const QString& relativePath) const {
+    const LanguageConfig* cfg = LanguageRegistry::instance().byPath(filePath);
+    TextFile file;
+    if (!cfg || !file.read(filePath)) return {};
+    return extract(file.text, *cfg, filePath, relativePath);
 }
 
-QVector<Comment> CommentExtractor::extractFromContent(const QString& content,
-                                                       const QString& language,
-                                                       const QString& filePath) {
-    // Find language config by name
-    const auto& registry = LanguageRegistry::instance();
-    QStringList extensions = registry.getExtensionsForLanguage(language);
-    if (extensions.isEmpty()) {
-        return {};
-    }
-    
-    const LanguageConfig* config = registry.getLanguageByExtension(extensions.first());
-    if (!config) {
-        return {};
-    }
-    
-    if (m_parserMethod == ParserMethod::TreeSitter) {
-        return extractWithTreeSitter(content, *config, filePath, filePath);
-    } else {
-        return extractWithLexer(content, *config, filePath, filePath);
-    }
+QVector<Comment> CommentExtractor::extractFromContent(const QString& content, const QString& language,
+                                                      const QString& filePath) const {
+    const LanguageConfig* cfg = LanguageRegistry::instance().byName(language);
+    return cfg ? extract(content, *cfg, filePath, filePath) : QVector<Comment>();
 }
 
-QVector<Comment> CommentExtractor::extractWithLexer(const QString& content,
-                                                     const LanguageConfig& config,
-                                                     const QString& filePath,
-                                                     const QString& relativePath) {
-    QVector<Comment> comments;
-    int pos = 0;
-    int length = content.length();
-    
-    while (pos < length) {
-        // Skip whitespace
-        while (pos < length && content[pos].isSpace()) {
-            pos++;
+QVector<Comment> CommentExtractor::extract(const QString& content, const LanguageConfig& config,
+                                           const QString& filePath, const QString& relativePath) const {
+    if (content.isEmpty()) return {};
+    Context ctx{content, config, filePath, relativePath, LineIndex(content), {}};
+    if (m_parserMethod != ParserMethod::TreeSitter || !parseTreeSitter(ctx)) lex(ctx);
+    return std::move(ctx.out);
+}
+
+void CommentExtractor::addComment(Context& ctx, int start, int end) const {
+    const LanguageConfig& cfg = ctx.cfg;
+    const QStringView raw = QStringView(ctx.text).mid(start, end - start);
+    if (start == 0 && raw.startsWith(u"#!")) return;  // shebang: a directive, not a comment
+
+    // Work out which delimiters surround the comment text.
+    int open = 0, close = 0;
+    bool block = false;
+    auto matchPair = [&](const QVector<Delimiter>& pairs) {
+        for (const Delimiter& d : pairs) {
+            if (!raw.startsWith(d.start)) continue;
+            open = int(d.start.size());
+            close = raw.size() >= open + d.end.size() && raw.endsWith(d.end) ? int(d.end.size()) : 0;
+            return block = true;
         }
-        
-        if (pos >= length) break;
-        
-        // Try to skip string literals
-        int newPos = skipString(content, pos, config);
-        if (newPos > pos) {
-            pos = newPos;
-            continue;
+        return false;
+    };
+    if (!matchPair(cfg.blocks) && !matchPair(cfg.strings)) {
+        for (const QString& m : cfg.lineMarkers)
+            if (raw.startsWith(m)) { open = int(m.size()); break; }
+    }
+    bool doc = false;  // doc markers ("///", "/**") are longer variants of the plain ones
+    for (const QString& m : block ? cfg.docBlockStarts : cfg.docLineMarkers) {
+        if (doc || !raw.startsWith(m) || raw.size() < m.size() + close) continue;
+        doc = true;
+        open = std::max(open, int(m.size()));
+    }
+
+    Comment c;
+    c.id = g_nextCommentId.fetch_add(1, std::memory_order_relaxed);
+    c.filePath = ctx.filePath;
+    c.relativePath = ctx.relativePath;
+    c.language = cfg.name;
+    c.rawText = raw.toString();
+    c.startLine = ctx.lines.line(start);
+    c.startColumn = start - ctx.lines.lineStart(c.startLine);
+    c.endLine = ctx.lines.line(end);
+    c.endColumn = end - ctx.lines.lineStart(c.endLine);
+
+    int cleanEnd = int(raw.size()) - close;
+    c.cleanStart = std::min(open, cleanEnd);
+    while (c.cleanStart < cleanEnd && raw[c.cleanStart].isSpace()) ++c.cleanStart;
+    while (cleanEnd > c.cleanStart && raw[cleanEnd - 1].isSpace()) --cleanEnd;
+    c.cleanLength = cleanEnd - c.cleanStart;
+
+    bool codeBefore = false;
+    for (int i = ctx.lines.lineStart(c.startLine); i < start && !codeBefore; ++i) codeBefore = !ctx.text[i].isSpace();
+    c.type = codeBefore ? Comment::Type::Inline
+           : doc        ? Comment::Type::DocComment
+           : block      ? Comment::Type::MultiLine
+                        : Comment::Type::SingleLine;
+
+    if (!m_keywordRegex.pattern().isEmpty() && c.cleanLength > 0) {
+        for (auto it = m_keywordRegex.globalMatch(c.cleanText()); it.hasNext();) {
+            const QString hit = it.next().captured();
+            for (const QString& k : m_keywords)
+                if (hit.compare(k.trimmed(), Qt::CaseInsensitive) == 0 && !c.keywords.contains(k)) c.keywords << k;
         }
-        
-        // Try to skip raw strings
-        newPos = skipRawString(content, pos, config);
-        if (newPos > pos) {
-            pos = newPos;
-            continue;
+    }
+    ctx.out.append(std::move(c));
+}
+
+void CommentExtractor::lex(Context& ctx) const {
+    const LanguageConfig& cfg = ctx.cfg;
+    const QString& text = ctx.text;
+    const QStringView v(text);
+    const int n = int(text.size());
+    auto at = [&](int p, QStringView tok) { return v.mid(p, tok.size()) == tok; };
+
+    // Characters that can begin something interesting; everything else is skipped quickly.
+    QString triggers = QStringLiteral("([{}])");
+    for (const auto& d : cfg.blocks) triggers += d.start[0];
+    for (const auto& d : cfg.strings) triggers += d.start[0];
+    for (const auto& m : cfg.lineMarkers) triggers += m[0];
+    if (cfg.cppRawStrings) triggers += u'R';
+    if (cfg.regexLiterals) triggers += u'/';
+
+    auto blockEnd = [&](int p, const Delimiter& d) {
+        int depth = 1, i = p + int(d.start.size());
+        while (true) {
+            const int close = int(text.indexOf(d.end, i));
+            if (close < 0) return n;
+            const int open = cfg.nestedBlocks ? int(text.indexOf(d.start, i)) : -1;
+            if (open >= 0 && open < close) { ++depth; i = open + int(d.start.size()); continue; }
+            if (--depth == 0) return close + int(d.end.size());
+            i = close + int(d.end.size());
         }
-        
-        // Try to skip regex literals (JavaScript, etc.)
-        if (config.hasRegexLiterals) {
-            newPos = skipRegex(content, pos, config);
-            if (newPos > pos) {
-                pos = newPos;
+    };
+    auto skipString = [&](int p) {
+        for (const Delimiter& d : cfg.strings) {
+            if (!at(p, d.start)) continue;
+            const bool multiLine = d.start.size() > 1 || d.start == u"`";
+            for (int i = p + int(d.start.size()); i < n; ++i) {
+                if (v[i] == u'\\') { ++i; continue; }
+                if (at(i, d.end)) return i + int(d.end.size());
+                if (!multiLine && v[i] == u'\n') return i;
+            }
+            return n;
+        }
+        return p;
+    };
+    auto skipRawString = [&](int p) {  // C++ R"delim(...)delim"
+        if (!at(p, u"R\"")) return p;
+        const int paren = int(text.indexOf(u'(', p + 2));
+        if (paren < 0 || paren - (p + 2) > 16 || v.mid(p + 2, paren - p - 2).contains(u'\n')) return p;
+        const QString endTok = u')' + v.mid(p + 2, paren - p - 2).toString() + u'"';
+        const int e = int(text.indexOf(endTok, paren + 1));
+        return e < 0 ? n : e + int(endTok.size());
+    };
+    auto skipRegex = [&](int p) {  // JavaScript /re/flags heuristic
+        if (v[p] != u'/' || at(p, u"//") || at(p, u"/*")) return p;
+        int prev = p - 1;
+        while (prev >= 0 && v[prev].isSpace()) --prev;
+        if (prev >= 0 && !QStringView(u"=:,([{!&|?;").contains(v[prev])) {
+            int w = prev;
+            while (w >= 0 && (v[w].isLetterOrNumber() || v[w] == u'_')) --w;
+            static const QStringList keywords = {"return", "throw", "yield", "case", "void", "typeof", "delete", "await"};
+            if (!keywords.contains(v.mid(w + 1, prev - w).toString())) return p;  // probably division
+        }
+        for (int i = p + 1; i < n; ++i) {
+            const QChar c = v[i];
+            if (c == u'\\') { ++i; continue; }
+            if (c == u'\n') return p;
+            if (c == u'[') {
+                while (++i < n && v[i] != u']' && v[i] != u'\n') if (v[i] == u'\\') ++i;
                 continue;
             }
+            if (c == u'/') {
+                while (i + 1 < n && v[i + 1].isLetter()) ++i;
+                return i + 1;
+            }
         }
-        
-        // Check for doc comments first (before regular comments)
-        bool foundDocComment = false;
-        
-        // Check doc line comments
-        for (const QString& marker : config.docLineMarkers) {
-            if (pos + marker.length() <= length && 
-                content.mid(pos, marker.length()) == marker) {
-                // Found doc line comment
-                int commentStart = pos;
-                int lineEnd = content.indexOf('\n', pos);
-                if (lineEnd == -1) lineEnd = length;
-                
-                Comment comment;
-                comment.id = m_nextCommentId++;
-                comment.filePath = filePath;
-                comment.relativePath = relativePath;
-                comment.language = config.name;
-                comment.type = Comment::Type::DocComment;
-                comment.rawText = content.mid(commentStart, lineEnd - commentStart);
-                comment.cleanText = content.mid(commentStart + marker.length(), lineEnd - commentStart - marker.length()).trimmed();
-                
-                auto [startLine, startCol] = positionToLineColumn(content, commentStart);
-                auto [endLine, endCol] = positionToLineColumn(content, lineEnd);
-                comment.startLine = startLine;
-                comment.startColumn = startCol;
-                comment.endLine = endLine;
-                comment.endColumn = endCol;
-                
-                // Check if inline
-                if (isInlineComment(content, commentStart)) {
-                    comment.type = Comment::Type::Inline;
-                    int lineStart = content.lastIndexOf('\n', commentStart - 1) + 1;
-                    comment.codeSegment = content.mid(lineStart, commentStart - lineStart).trimmed();
-                    comment.commentSegment = comment.rawText;
-                }
-                
-                comment.fullLines = getLine(content, startLine);
-                extractContext(content, comment);
-                detectKeywords(comment);
-                
-                comments.append(comment);
-                pos = lineEnd + 1;
-                foundDocComment = true;
+        return p;
+    };
+    auto onlySpaceBefore = [&](int p) {
+        for (int i = p - 1; i >= 0 && v[i] != u'\n'; --i) if (!v[i].isSpace()) return false;
+        return true;
+    };
+    auto continuesStatement = [&](int p) {  // previous line ends with '\' or '=' (e.g. x = \ """...""")
+        int i = p - 1;
+        while (i >= 0 && v[i].isSpace()) --i;
+        return i >= 0 && (v[i] == u'\\' || v[i] == u'=');
+    };
+
+    int depth = 0;  // bracket depth; docstrings only appear outside brackets
+    for (int p = 0; p < n;) {
+        const QChar c = v[p];
+        if (c.isSpace() || !triggers.contains(c)) { ++p; continue; }
+
+        int end = -1;
+        if (cfg.blocksAtLineStart && depth == 0 && onlySpaceBefore(p) && !continuesStatement(p)) {
+            for (const Delimiter& d : cfg.blocks) if (at(p, d.start)) { end = blockEnd(p, d); break; }
+        }
+        if (end < 0) {
+            int skipped = skipString(p);
+            if (skipped == p && cfg.cppRawStrings) skipped = skipRawString(p);
+            if (skipped == p && cfg.regexLiterals) skipped = skipRegex(p);
+            if (skipped > p) { p = skipped; continue; }
+        }
+        if (end < 0 && !cfg.blocksAtLineStart) {
+            for (const Delimiter& d : cfg.blocks) if (at(p, d.start)) { end = blockEnd(p, d); break; }
+        }
+        if (end < 0 && (!cfg.markerNeedsSpace || p == 0 || v[p - 1].isSpace())) {
+            for (const QString& m : cfg.lineMarkers) {
+                if (!at(p, m) || (m == u"#" && at(p + 1, u"[") && cfg.name == u"PHP")) continue;  // PHP 8 attribute
+                end = int(text.indexOf(u'\n', p));
+                if (end < 0) end = n;
                 break;
             }
         }
-        
-        if (foundDocComment) continue;
-        
-        // Check doc block comments
-        for (const auto& delim : config.docBlockDelimiters) {
-            if (pos + delim.start.length() <= length &&
-                content.mid(pos, delim.start.length()) == delim.start) {
-                // Found doc block comment start
-                int commentStart = pos;
-                int endPos = content.indexOf(delim.end, pos + delim.start.length());
-                if (endPos == -1) endPos = length - delim.end.length();
-                endPos += delim.end.length();
-                
-                Comment comment;
-                comment.id = m_nextCommentId++;
-                comment.filePath = filePath;
-                comment.relativePath = relativePath;
-                comment.language = config.name;
-                comment.type = Comment::Type::DocComment;
-                comment.rawText = content.mid(commentStart, endPos - commentStart);
-                comment.cleanText = content.mid(commentStart + delim.start.length(), 
-                                                 endPos - commentStart - delim.start.length() - delim.end.length()).trimmed();
-                
-                auto [startLine, startCol] = positionToLineColumn(content, commentStart);
-                auto [endLine, endCol] = positionToLineColumn(content, endPos);
-                comment.startLine = startLine;
-                comment.startColumn = startCol;
-                comment.endLine = endLine;
-                comment.endColumn = endCol;
-                
-                // Get all lines
-                QString lines;
-                for (int l = startLine; l <= endLine; l++) {
-                    if (!lines.isEmpty()) lines += "\n";
-                    lines += getLine(content, l);
-                }
-                comment.fullLines = lines;
-                
-                extractContext(content, comment);
-                detectKeywords(comment);
-                
-                comments.append(comment);
-                pos = endPos;
-                foundDocComment = true;
-                break;
-            }
-        }
-        
-        if (foundDocComment) continue;
-        
-        // Check for single-line comments
-        QString marker = matchSingleLineStart(content, pos, config);
-        if (!marker.isEmpty()) {
-            int commentStart = pos;
-            int lineEnd = content.indexOf('\n', pos);
-            if (lineEnd == -1) lineEnd = length;
-            
-            Comment comment;
-            comment.id = m_nextCommentId++;
-            comment.filePath = filePath;
-            comment.relativePath = relativePath;
-            comment.language = config.name;
-            comment.rawText = content.mid(commentStart, lineEnd - commentStart);
-            comment.cleanText = content.mid(commentStart + marker.length(), lineEnd - commentStart - marker.length()).trimmed();
-            
-            auto [startLine, startCol] = positionToLineColumn(content, commentStart);
-            auto [endLine, endCol] = positionToLineColumn(content, lineEnd);
-            comment.startLine = startLine;
-            comment.startColumn = startCol;
-            comment.endLine = endLine;
-            comment.endColumn = endCol;
-            
-            // Check if inline (code before comment on same line)
-            if (isInlineComment(content, commentStart)) {
-                comment.type = Comment::Type::Inline;
-                int lineStart = content.lastIndexOf('\n', commentStart - 1) + 1;
-                comment.codeSegment = content.mid(lineStart, commentStart - lineStart).trimmed();
-                comment.commentSegment = comment.rawText;
-            } else {
-                comment.type = Comment::Type::SingleLine;
-            }
-            
-            comment.fullLines = getLine(content, startLine);
-            extractContext(content, comment);
-            detectKeywords(comment);
-            
-            comments.append(comment);
-            pos = lineEnd + 1;
+        if (end >= 0) {
+            addComment(ctx, p, end);
+            p = std::max(end, p + 1);
             continue;
         }
-        
-        // Check for block comments
-        auto [blockStart, blockEnd] = matchBlockStart(content, pos, config);
-        if (!blockStart.isEmpty()) {
-            int commentStart = pos;
-            int endPos;
-            
-            if (config.supportsNestedComments) {
-                // Handle nested comments
-                int depth = 1;
-                int searchPos = pos + blockStart.length();
-                while (searchPos < length && depth > 0) {
-                    int nextStart = content.indexOf(blockStart, searchPos);
-                    int nextEnd = content.indexOf(blockEnd, searchPos);
-                    
-                    if (nextEnd == -1) {
-                        endPos = length;
-                        break;
-                    }
-                    
-                    if (nextStart != -1 && nextStart < nextEnd) {
-                        depth++;
-                        searchPos = nextStart + blockStart.length();
-                    } else {
-                        depth--;
-                        searchPos = nextEnd + blockEnd.length();
-                        if (depth == 0) {
-                            endPos = searchPos;
-                        }
-                    }
-                }
-            } else {
-                endPos = content.indexOf(blockEnd, pos + blockStart.length());
-                if (endPos == -1) {
-                    endPos = length;
-                } else {
-                    endPos += blockEnd.length();
-                }
-            }
-            
-            Comment comment;
-            comment.id = m_nextCommentId++;
-            comment.filePath = filePath;
-            comment.relativePath = relativePath;
-            comment.language = config.name;
-            comment.type = Comment::Type::MultiLine;
-            comment.rawText = content.mid(commentStart, endPos - commentStart);
-            comment.cleanText = content.mid(commentStart + blockStart.length(),
-                                             endPos - commentStart - blockStart.length() - blockEnd.length()).trimmed();
-            
-            auto [startLine, startCol] = positionToLineColumn(content, commentStart);
-            auto [endLine, endCol] = positionToLineColumn(content, endPos);
-            comment.startLine = startLine;
-            comment.startColumn = startCol;
-            comment.endLine = endLine;
-            comment.endColumn = endCol;
-            
-            // Check if inline
-            if (isInlineComment(content, commentStart)) {
-                comment.type = Comment::Type::Inline;
-                int lineStart = content.lastIndexOf('\n', commentStart - 1) + 1;
-                comment.codeSegment = content.mid(lineStart, commentStart - lineStart).trimmed();
-                comment.commentSegment = comment.rawText;
-            }
-            
-            // Get all lines
-            QString lines;
-            for (int l = startLine; l <= endLine; l++) {
-                if (!lines.isEmpty()) lines += "\n";
-                lines += getLine(content, l);
-            }
-            comment.fullLines = lines;
-            
-            extractContext(content, comment);
-            detectKeywords(comment);
-            
-            comments.append(comment);
-            pos = endPos;
-            continue;
-        }
-        
-        // Not in a comment or string, advance
-        pos++;
-    }
-    
-    return comments;
-}
-
-int CommentExtractor::skipString(const QString& content, int pos, const LanguageConfig& config) const {
-    for (const QString& delim : config.stringDelimiters) {
-        if (pos + delim.length() <= content.length() &&
-            content.mid(pos, delim.length()) == delim) {
-            
-            // Handle triple-quoted strings (Python, etc.)
-            if (delim.length() == 3) {
-                int searchStart = pos + delim.length();
-                while (true) {
-                    int endPos = content.indexOf(delim, searchStart);
-                    if (endPos == -1) return content.length();
-                    
-                    // Check for odd number of backslashes before endPos (escaped delimiter)
-                    int backslashCount = 0;
-                    for (int i = endPos - 1; i >= pos; i--) {
-                        if (content[i] == '\\') backslashCount++;
-                        else break;
-                    }
-                    
-                    if (backslashCount % 2 == 0) {
-                        return endPos + delim.length();
-                    }
-                    
-                    // Escaped, continue search
-                    searchStart = endPos + 1;
-                }
-            }
-            
-            // Handle generic multi-character delimiters (e.g., Lua [[ ... ]])
-            if (delim.length() > 1) {
-                int endPos = content.indexOf(delim, pos + delim.length());
-                if (endPos == -1) {
-                    // Unterminated string: consume to end of content
-                    return content.length();
-                }
-                return endPos + delim.length();
-            }
-            
-            // Single character delimiter
-            QChar quote = delim[0];
-            int searchPos = pos + 1;
-            
-            while (searchPos < content.length()) {
-                QChar c = content[searchPos];
-                
-                if (c == '\\') {
-                    // Skip escaped character
-                    searchPos += 2;
-                    continue;
-                }
-                
-                if (c == quote) {
-                    return searchPos + 1;
-                }
-                
-                // Handle newlines (in most languages strings don't span lines)
-                if (c == '\n' && quote != '`') {  // Template literals can span lines
-                    return searchPos;
-                }
-                
-                searchPos++;
-            }
-            
-            return content.length();
-        }
-    }
-    
-    return pos;
-}
-
-int CommentExtractor::skipRawString(const QString& content, int pos, const LanguageConfig& config) const {
-    for (const QString& marker : config.rawStringMarkers) {
-        if (pos + marker.length() <= content.length() &&
-            content.mid(pos, marker.length()) == marker) {
-            
-            // C++ raw string: R"delimiter(...)delimiter"
-            // Find the delimiter
-            int delimStart = pos + 2;  // After R"
-            int parenPos = content.indexOf('(', delimStart);
-            if (parenPos == -1) return pos;
-            
-            QString delimiter = content.mid(delimStart, parenPos - delimStart);
-            QString endMarker = ")" + delimiter + "\"";
-            
-            int endPos = content.indexOf(endMarker, parenPos + 1);
-            if (endPos == -1) return content.length();
-            
-            return endPos + endMarker.length();
-        }
-    }
-    
-    return pos;
-}
-
-int CommentExtractor::skipRegex(const QString& content, int pos, const LanguageConfig& config) const {
-    Q_UNUSED(config);
-    
-    // Simple heuristic for JavaScript regex literals
-    // A regex starts with / and is not followed by another / or *
-    if (pos >= content.length() || content[pos] != '/') {
-        return pos;
-    }
-    
-    // Check it's not // or /*
-    if (pos + 1 < content.length()) {
-        QChar next = content[pos + 1];
-        if (next == '/' || next == '*') {
-            return pos;  // It's a comment, not regex
-        }
-    }
-    
-    // Try to detect if this is a regex by looking at what precedes it
-    // This is a simplification - real parsing would need more context
-    int prevNonSpace = pos - 1;
-    while (prevNonSpace >= 0 && content[prevNonSpace].isSpace()) {
-        prevNonSpace--;
-    }
-    
-    if (prevNonSpace >= 0) {
-        QChar prev = content[prevNonSpace];
-        // If preceded by these characters, it's likely a regex
-        QString regexPrecursors = "=:,([{!&|?;";
-        if (!regexPrecursors.contains(prev)) {
-            // Check for keywords like return, throw, etc.
-            // Read backwards to get the word
-            int wordEnd = prevNonSpace;
-            int wordStart = wordEnd;
-            while (wordStart >= 0 && (content[wordStart].isLetterOrNumber() || content[wordStart] == '_')) {
-                wordStart--;
-            }
-            wordStart++;
-
-            bool isKeyword = false;
-            if (wordStart <= wordEnd) {
-                QString word = content.mid(wordStart, wordEnd - wordStart + 1);
-                static const QStringList keywords = {
-                    "return", "throw", "yield", "case", "void", "typeof", "delete", "await"
-                };
-                if (keywords.contains(word)) {
-                    isKeyword = true;
-                }
-            }
-
-            if (!isKeyword) {
-                return pos;  // Probably division operator
-            }
-        }
-    }
-    
-    // Find the end of the regex
-    int searchPos = pos + 1;
-    while (searchPos < content.length()) {
-        QChar c = content[searchPos];
-        
-        if (c == '\\') {
-            searchPos += 2;  // Skip escaped character
-            continue;
-        }
-        
-        if (c == '[') {
-            // Character class - find closing ]
-            searchPos++;
-            while (searchPos < content.length() && content[searchPos] != ']') {
-                if (content[searchPos] == '\\') {
-                    searchPos++;
-                }
-                searchPos++;
-            }
-            searchPos++;
-            continue;
-        }
-        
-        if (c == '/') {
-            // End of regex - skip flags
-            searchPos++;
-            while (searchPos < content.length() && content[searchPos].isLetter()) {
-                searchPos++;
-            }
-            return searchPos;
-        }
-        
-        if (c == '\n') {
-            return pos;  // Not a valid regex
-        }
-        
-        searchPos++;
-    }
-    
-    return pos;
-}
-
-QString CommentExtractor::matchSingleLineStart(const QString& content, int pos, const LanguageConfig& config) const {
-    // Sort markers by length (longest first) to match correctly
-    QStringList markers = config.singleLineMarkers;
-    std::sort(markers.begin(), markers.end(), [](const QString& a, const QString& b) {
-        return a.length() > b.length();
-    });
-    
-    for (const QString& marker : markers) {
-        if (pos + marker.length() <= content.length() &&
-            content.mid(pos, marker.length()) == marker) {
-            return marker;
-        }
-    }
-    
-    return QString();
-}
-
-QPair<QString, QString> CommentExtractor::matchBlockStart(const QString& content, int pos, const LanguageConfig& config) const {
-    for (const auto& delim : config.blockDelimiters) {
-        if (pos + delim.start.length() <= content.length() &&
-            content.mid(pos, delim.start.length()) == delim.start) {
-            return {delim.start, delim.end};
-        }
-    }
-    
-    return {QString(), QString()};
-}
-
-void CommentExtractor::extractContext(const QString& content, Comment& comment) const {
-    // Get lines before
-    QStringList linesBefore;
-    for (int i = 1; i <= m_contextLines; i++) {
-        int lineNum = comment.startLine - i;
-        if (lineNum > 0) {
-            linesBefore.prepend(getLine(content, lineNum));
-        }
-    }
-    comment.contextBefore = linesBefore.join("\n");
-    
-    // Get lines after
-    QStringList linesAfter;
-    for (int i = 1; i <= m_contextLines; i++) {
-        int lineNum = comment.endLine + i;
-        QString line = getLine(content, lineNum);
-        if (!line.isNull()) {
-            linesAfter.append(line);
-        }
-    }
-    comment.contextAfter = linesAfter.join("\n");
-}
-
-void CommentExtractor::detectKeywords(Comment& comment) const {
-    QString text = comment.cleanText.toUpper();
-    
-    for (const QString& keyword : m_keywords) {
-        // Match keyword at word boundary
-        QRegularExpression regex("\\b" + QRegularExpression::escape(keyword.toUpper()) + "\\b");
-        if (regex.match(text).hasMatch()) {
-            comment.keywords.append(keyword);
-        }
+        if (c == u'(' || c == u'[' || c == u'{') ++depth;
+        else if ((c == u')' || c == u']' || c == u'}') && depth > 0) --depth;
+        ++p;
     }
 }
 
-QPair<int, int> CommentExtractor::positionToLineColumn(const QString& content, int pos) const {
-    int line = 1;
-    int column = 0;
-    int lastNewline = -1;
-    
-    for (int i = 0; i < pos && i < content.length(); i++) {
-        if (content[i] == '\n') {
-            line++;
-            lastNewline = i;
-        }
-    }
-    
-    column = pos - lastNewline - 1;
-    return {line, column};
-}
+bool CommentExtractor::parseTreeSitter(Context& ctx) const {
+    const TSLanguage* language = grammarFor(ctx.cfg.name);
+    if (!language) return false;
+    thread_local std::unique_ptr<TSParser, ParserDeleter> parser(ts_parser_new());
+    if (!ts_parser_set_language(parser.get(), language)) return false;
 
-QString CommentExtractor::getLine(const QString& content, int lineNumber) const {
-    if (lineNumber < 1) return QString();
-    
-    int currentLine = 1;
-    int lineStart = 0;
-    
-    for (int i = 0; i < content.length(); i++) {
-        if (currentLine == lineNumber) {
-            int lineEnd = content.indexOf('\n', i);
-            if (lineEnd == -1) lineEnd = content.length();
-            return content.mid(lineStart, lineEnd - lineStart);
-        }
-        
-        if (content[i] == '\n') {
-            currentLine++;
-            lineStart = i + 1;
-        }
-    }
-    
-    if (currentLine == lineNumber) {
-        return content.mid(lineStart);
-    }
-    
-    return QString();
-}
+    // QString is UTF-16, so byte offsets divided by two are QString indices.
+    std::unique_ptr<TSTree, TreeDeleter> tree(ts_parser_parse_string_encoding(
+        parser.get(), nullptr, reinterpret_cast<const char*>(ctx.text.utf16()), uint32_t(ctx.text.size() * 2),
+        TSInputEncodingUTF16));
+    if (!tree) return false;
+    const TSNode root = ts_tree_root_node(tree.get());
+    // Syntax the grammar does not understand (e.g. TypeScript types, unexpanded macros)
+    // is handled more predictably by the lexer.
+    if (ts_node_is_null(root) || ts_node_has_error(root)) return false;
 
-bool CommentExtractor::isInlineComment(const QString& content, int commentStart) const {
-    // Find start of line
-    int lineStart = content.lastIndexOf('\n', commentStart - 1) + 1;
-    
-    // Check if there's non-whitespace code before the comment on this line
-    QString before = content.mid(lineStart, commentStart - lineStart);
-    return !before.trimmed().isEmpty();
-}
-
-QVector<Comment> CommentExtractor::extractWithTreeSitter(const QString& content,
-                                                          const LanguageConfig& config,
-                                                          const QString& filePath,
-                                                          const QString& relativePath) {
-    // Map language to TSLanguage
-    const TSLanguage* tsLanguage = nullptr;
-    if (config.name == "JSON" || config.name == "JSONC") {
-        tsLanguage = tree_sitter_json();
-    } else if (config.name == "C/C++") {
-        tsLanguage = tree_sitter_cpp();
-    } else if (config.name == "Python") {
-        tsLanguage = tree_sitter_python();
-    } else if (config.name == "JavaScript" || config.name == "TypeScript") {
-        tsLanguage = tree_sitter_javascript();
-    }
-
-    if (!tsLanguage) {
-        // Fall back to lexer if grammar not available for this language
-        return extractWithLexer(content, config, filePath, relativePath);
-    }
-
-    TSParser* parser = ts_parser_new();
-    ts_parser_set_language(parser, tsLanguage);
-
-    // Use UTF-16 to match QString internal encoding
-    const ushort* buffer = content.utf16();
-    uint32_t length = content.length() * 2; // bytes
-
-    TSTree* tree = ts_parser_parse_string_encoding(
-        parser,
-        NULL,
-        reinterpret_cast<const char*>(buffer),
-        length,
-        TSInputEncodingUTF16
-    );
-    
-    TSNode root_node = ts_tree_root_node(tree);
-    QVector<Comment> comments;
-    
-    TSTreeCursor cursor = ts_tree_cursor_new(root_node);
-    
-    // Traverse the tree
-    bool working = true;
-    // Handle empty tree
-    if (ts_node_is_null(root_node)) {
-        working = false;
-    }
-
-    while (working) {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
+    const bool python = ctx.cfg.name == u"Python";
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (bool more = true; more;) {
+        const TSNode node = ts_tree_cursor_current_node(&cursor);
         const char* type = ts_node_type(node);
-
-        // Check if it is a comment
-        // different grammars might use different names, but "comment" is standard.
-        // C++ uses "comment"
-        // JSON uses "comment"
-        // Python uses "comment"
-        bool isComment = (strcmp(type, "comment") == 0 || strcmp(type, "line_comment") == 0 || strcmp(type, "block_comment") == 0);
-        
-        // Special handling for Python docstrings (which are expression statements containing a string)
-        if (!isComment && config.name == "Python" && strcmp(type, "string") == 0) {
-            TSNode parent = ts_node_parent(node);
-            if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "expression_statement") == 0) {
-                isComment = true;
-            }
+        bool comment = isTsComment(type);
+        if (!comment && python && !std::strcmp(type, "string")) {  // docstring = string used as a statement
+            const TSNode parent = ts_node_parent(node);
+            comment = !ts_node_is_null(parent) && !std::strcmp(ts_node_type(parent), "expression_statement");
         }
-
-        if (isComment) {
-             uint32_t start_byte = ts_node_start_byte(node);
-             uint32_t end_byte = ts_node_end_byte(node);
-             TSPoint start_point = ts_node_start_point(node);
-             TSPoint end_point = ts_node_end_point(node);
-
-             Comment comment;
-             comment.id = m_nextCommentId++;
-             comment.filePath = filePath;
-             comment.relativePath = relativePath;
-             comment.language = config.name;
-
-             // Convert byte offsets to QString indices (divide by 2 for UTF-16)
-             int startIdx = start_byte / 2;
-             int lengthChars = (end_byte - start_byte) / 2;
-
-             comment.rawText = content.mid(startIdx, lengthChars);
-
-             // Clean text - simple heuristic based on config
-             QString clean = comment.rawText;
-             // Remove block delimiters
-             for (const auto& delim : config.blockDelimiters) {
-                 if (clean.startsWith(delim.start) && clean.endsWith(delim.end)) {
-                     clean = clean.mid(delim.start.length(), clean.length() - delim.start.length() - delim.end.length());
-                     break;
-                 }
-             }
-             // Remove single line markers
-             for (const auto& marker : config.singleLineMarkers) {
-                 if (clean.startsWith(marker)) {
-                     clean = clean.mid(marker.length());
-                     break;
-                 }
-             }
-             comment.cleanText = clean.trimmed();
-
-             // Tree-sitter columns are byte offsets. For UTF-16, divide by 2 to get character index.
-             comment.startLine = start_point.row + 1;
-             comment.startColumn = start_point.column / 2;
-             comment.endLine = end_point.row + 1;
-             comment.endColumn = end_point.column / 2;
-
-             if (comment.startLine == comment.endLine) {
-                 if (isInlineComment(content, startIdx)) {
-                     comment.type = Comment::Type::Inline;
-                     int lineStart = content.lastIndexOf('\n', startIdx - 1) + 1;
-                     comment.codeSegment = content.mid(lineStart, startIdx - lineStart).trimmed();
-                     comment.commentSegment = comment.rawText;
-                 } else {
-                     comment.type = Comment::Type::SingleLine;
-                 }
-             } else {
-                 comment.type = Comment::Type::MultiLine;
-             }
-
-             // Check for doc comment
-             bool isDoc = false;
-             for (const auto& marker : config.docLineMarkers) {
-                 if (comment.rawText.startsWith(marker)) {
-                     comment.type = Comment::Type::DocComment;
-                     isDoc = true;
-                     break;
-                 }
-             }
-             if (!isDoc) {
-                 for (const auto& delim : config.docBlockDelimiters) {
-                     if (comment.rawText.startsWith(delim.start)) {
-                         comment.type = Comment::Type::DocComment;
-                         break;
-                     }
-                 }
-             }
-
-             comment.fullLines = getLine(content, comment.startLine);
-             if (comment.endLine > comment.startLine) {
-                 for (int l = comment.startLine + 1; l <= comment.endLine; l++) {
-                     QString line = getLine(content, l);
-                     if (!line.isEmpty()) {
-                         comment.fullLines += "\n" + line;
-                     }
-                 }
-             }
-
-             extractContext(content, comment);
-             detectKeywords(comment);
-
-             comments.append(comment);
-        }
-
-        // Depth-first traversal
-        if (ts_tree_cursor_goto_first_child(&cursor)) {
-            continue;
-        }
-
-        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
-            continue;
-        }
-
-        // Go up and next
-        while (true) {
-            if (!ts_tree_cursor_goto_parent(&cursor)) {
-                working = false;
-                break;
-            }
-            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
-                break;
-            }
+        if (comment) addComment(ctx, int(ts_node_start_byte(node) / 2), int(ts_node_end_byte(node) / 2));
+        if (!comment && ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) { more = false; break; }
         }
     }
-
     ts_tree_cursor_delete(&cursor);
-    ts_tree_delete(tree);
-    ts_parser_delete(parser);
-
-    return comments;
+    return true;
 }

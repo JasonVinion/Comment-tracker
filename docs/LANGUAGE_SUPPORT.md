@@ -96,9 +96,10 @@ The application supports two extraction methods:
    - Supports nested comments for languages that allow them
    - Detects inline comments (code followed by comment on same line)
 
-2. **Tree-sitter**: Parser-based extraction (available for JSON, C/C++, Python, JS/TS).
-   - Uses actual language grammars for 100% accuracy
-   - Handles complex constructs like regex literals, template strings, and heredocs correctly
+2. **Tree-sitter**: Parser-based extraction (available for JSON, C/C++, Python and JavaScript).
+   - Uses actual language grammars, so regex literals and template strings are handled correctly
+   - Python docstrings (strings used as statements) are reported as doc comments
+   - Files the grammar cannot parse (e.g. TypeScript type annotations, unusual macros) fall back to the lexer
 
 ### Known Limitations (Lexer-mode)
 

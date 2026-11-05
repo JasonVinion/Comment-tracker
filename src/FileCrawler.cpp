@@ -1,339 +1,146 @@
 #include "FileCrawler.h"
 #include "LanguageRegistry.h"
 #include <QDir>
-#include <QDirIterator>
-#include <QFile>
-#include <QTextStream>
+#include <QPromise>
 #include <QRegularExpression>
 #include <QtConcurrent>
+#include <optional>
 
-const QStringList FileCrawler::DEFAULT_IGNORE_PATTERNS = {
-    ".git",
-    ".svn",
-    ".hg",
-    ".bzr",
-    "node_modules",
-    "vendor",
-    "build",
-    "dist",
-    "out",
-    "bin",
-    "obj",
-    "target",
-    ".idea",
-    ".vscode",
-    ".vs",
-    "__pycache__",
-    "*.pyc",
-    "*.pyo",
-    ".DS_Store",
-    "Thumbs.db",
-    "*.min.js",
-    "*.min.css",
-    "*.map",
-    "*.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "*.log"
+namespace {
+struct Rule {
+    QRegularExpression regex;
+    bool negate = false, dirOnly = false;
 };
 
-FileCrawler::FileCrawler(QObject* parent)
-    : QObject(parent) {
-    addIgnorePatterns(DEFAULT_IGNORE_PATTERNS);
+/// Rules from one ignore source, matched against paths relative to `prefix`.
+struct Layer {
+    QString prefix;
+    QVector<Rule> rules;
+};
+
+QString globToRegex(QStringView glob) {
+    QString re;
+    for (qsizetype i = 0; i < glob.size(); ++i) {
+        const QChar c = glob[i];
+        if (c == u'*' && glob.mid(i, 3) == u"**/") { re += QLatin1String("(?:.*/)?"); i += 2; }
+        else if (c == u'*' && glob.mid(i, 2) == u"**") { re += QLatin1String(".*"); ++i; }
+        else if (c == u'*') re += QLatin1String("[^/]*");
+        else if (c == u'?') re += QLatin1String("[^/]");
+        else if (c == u'[' && glob.indexOf(u']', i + 1) > i + 1) {
+            const qsizetype close = glob.indexOf(u']', i + 1);
+            QString set = glob.mid(i + 1, close - i - 1).toString();
+            if (set.startsWith(u'!')) set[0] = u'^';
+            re += u'[' + set + u']';
+            i = close;
+        } else if (c == u'\\' && i + 1 < glob.size()) re += QRegularExpression::escape(glob.mid(++i, 1).toString());
+        else re += QRegularExpression::escape(QString(c));
+    }
+    return re;
 }
 
-void FileCrawler::setRootPath(const QString& path) {
-    m_rootPath = path;
+std::optional<Rule> compileRule(QString pattern) {
+    pattern = pattern.trimmed();
+    if (pattern.isEmpty() || pattern.startsWith(u'#')) return std::nullopt;
+    Rule rule;
+    if ((rule.negate = pattern.startsWith(u'!'))) pattern.remove(0, 1);
+    if ((rule.dirOnly = pattern.endsWith(u'/'))) pattern.chop(1);
+    const bool anchored = pattern.contains(u'/');  // "a/b" and "/a" are relative to the ignore file
+    if (pattern.startsWith(u'/')) pattern.remove(0, 1);
+    if (pattern.isEmpty()) return std::nullopt;
+    rule.regex = QRegularExpression((anchored ? "^" : "(?:^|/)") + globToRegex(pattern) + "$");
+    if (!rule.regex.isValid()) return std::nullopt;
+    rule.regex.optimize();
+    return rule;
 }
 
-void FileCrawler::addIgnorePatterns(const QStringList& patterns) {
-    QMutexLocker locker(&m_mutex);
-    m_ignorePatterns.append(patterns);
+QVector<Rule> compileRules(const QStringList& patterns) {
+    QVector<Rule> rules;
+    for (const QString& p : patterns)
+        if (auto rule = compileRule(p)) rules.append(std::move(*rule));
+    return rules;
 }
 
-void FileCrawler::clearIgnorePatterns() {
-    QMutexLocker locker(&m_mutex);
-    m_ignorePatterns.clear();
+bool ignoredBy(const QVector<Layer>& layers, const QString& path, bool isDir) {
+    bool ignored = false;  // like git: the last matching rule wins
+    for (const Layer& layer : layers) {
+        const QString sub = path.mid(layer.prefix.size());
+        for (const Rule& r : layer.rules)
+            if (r.negate == ignored && (!r.dirOnly || isDir) && r.regex.match(sub).hasMatch()) ignored = !r.negate;
+    }
+    return ignored;
 }
 
-void FileCrawler::setIncludeExtensions(const QStringList& extensions) {
-    QMutexLocker locker(&m_mutex);
-    m_includeExtensions.clear();
-    for (const QString& ext : extensions) {
-        QString e = ext.toLower();
-        if (e.startsWith('.')) {
-            e = e.mid(1);
-        }
-        m_includeExtensions.insert(e);
-    }
-}
+struct Walker {
+    const FileCrawler::Options& options;
+    QPromise<FileCrawler::Result>* promise;
+    QVector<Layer> layers;
+    FileCrawler::Result result;
+    const LanguageRegistry& languages = LanguageRegistry::instance();
 
-void FileCrawler::startScan() {
-    if (m_running) {
-        return;
-    }
-    
-    if (m_rootPath.isEmpty()) {
-        emit error("No root path specified");
-        return;
-    }
-    
-    QDir dir(m_rootPath);
-    if (!dir.exists()) {
-        emit error("Root path does not exist: " + m_rootPath);
-        return;
-    }
-    
-    m_running = true;
-    m_cancelled = false;
-    m_filesScanned = 0;
-    m_codeFilesFound = 0;
-    m_gitignoreByDir.clear();
-    
-    // Start async scan
-    m_scanFuture = QtConcurrent::run([this]() {
-        scanDirectory(m_rootPath);
-        
-        if (m_cancelled) {
-            emit cancelled();
-        } else {
-            emit scanComplete(m_filesScanned, m_codeFilesFound);
-        }
-        m_running = false;
-    });
-}
-
-void FileCrawler::cancel() {
-    m_cancelled = true;
-}
-
-void FileCrawler::scanDirectory(const QString& path, int depth) {
-    if (m_cancelled) {
-        return;
-    }
-    
-    QDir dir(path);
-    if (!dir.exists()) {
-        return;
-    }
-    
-    // Load .gitignore if present
-    if (m_useGitignore) {
-        loadGitignore(path);
-    }
-    
-    // Get all entries
-    QFileInfoList entries = dir.entryInfoList(
-        QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot,
-        QDir::Name | QDir::DirsFirst
-    );
-    
-    for (const QFileInfo& entry : entries) {
-        if (m_cancelled) {
-            return;
-        }
-        
-        QString fullPath = entry.absoluteFilePath();
-        QString relativePath = QDir(m_rootPath).relativeFilePath(fullPath);
-        
-        // Check ignore patterns
-        if (shouldIgnore(relativePath)) {
-            continue;
-        }
-        
-        if (entry.isDir()) {
-            // Recurse into subdirectory
-            scanDirectory(fullPath, depth + 1);
-        } else if (entry.isFile()) {
-            m_filesScanned++;
-            
-            // Check if it's a code file
-            if (isCodeFile(fullPath)) {
-                // Skip binary files
-                if (!isBinaryFile(fullPath)) {
-                    m_codeFilesFound++;
-                    emit fileFound(fullPath);
-                }
-            }
-            
-            // Report progress periodically
-            if (m_filesScanned % 100 == 0) {
-                emit progress(m_filesScanned, m_codeFilesFound, relativePath);
+    void walk(const QString& dirPath, const QString& relDir) {
+        bool pushed = false;
+        if (options.useGitignore) {
+            QFile file(dirPath + QLatin1String("/.gitignore"));
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QVector<Rule> rules = compileRules(QString::fromUtf8(file.readAll()).split(u'\n'));
+                if ((pushed = !rules.isEmpty())) layers.append({relDir.isEmpty() ? QString() : relDir + u'/', rules});
             }
         }
-    }
-}
-
-bool FileCrawler::shouldIgnore(const QString& path) const {
-    // Check built-in patterns
-    {
-        QMutexLocker locker(&m_mutex);
-        for (const QString& pattern : m_ignorePatterns) {
-            if (matchesPattern(path, pattern)) {
-                return true;
-            }
-        }
-    }
-    
-    // Check gitignore patterns - only patterns from parent directories apply
-    // Walk up the path hierarchy and check patterns from each gitignore
-    QFileInfo pathInfo(QDir(m_rootPath).filePath(path));
-    QString currentDir = pathInfo.isDir() ? path : pathInfo.path();
-    
-    // Check patterns from each ancestor directory's .gitignore
-    while (!currentDir.isEmpty() && currentDir != ".") {
-        QString fullDirPath = QDir(m_rootPath).filePath(currentDir);
-        auto it = m_gitignoreByDir.find(fullDirPath);
-        if (it != m_gitignoreByDir.end()) {
-            // Get relative path from the gitignore directory
-            QString relativeToDirPath = QDir(fullDirPath).relativeFilePath(
-                QDir(m_rootPath).filePath(path));
-            for (const QString& pattern : it.value()) {
-                if (matchesPattern(relativeToDirPath, pattern) || 
-                    matchesPattern(path, pattern)) {
-                    return true;
-                }
-            }
-        }
-        
-        // Move to parent directory
-        int lastSlash = currentDir.lastIndexOf('/');
-        if (lastSlash > 0) {
-            currentDir = currentDir.left(lastSlash);
-        } else {
-            break;
-        }
-    }
-    
-    // Also check root .gitignore
-    auto rootIt = m_gitignoreByDir.find(m_rootPath);
-    if (rootIt != m_gitignoreByDir.end()) {
-        for (const QString& pattern : rootIt.value()) {
-            if (matchesPattern(path, pattern)) {
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
-bool FileCrawler::matchesPattern(const QString& path, const QString& pattern) const {
-    // Simple glob matching
-    QString regexPattern = pattern;
-    
-    // Handle directory patterns
-    if (pattern.endsWith('/')) {
-        // Match directory name anywhere in path
-        QString dirName = pattern.left(pattern.length() - 1);
-        return path.contains("/" + dirName + "/") || 
-               path.startsWith(dirName + "/") ||
-               path == dirName;
-    }
-    
-    // Handle simple patterns without wildcards
-    if (!pattern.contains('*') && !pattern.contains('?')) {
-        // Match as path component
-        return path.contains("/" + pattern) || 
-               path.startsWith(pattern + "/") ||
-               path.endsWith("/" + pattern) ||
-               path == pattern;
-    }
-    
-    // Convert glob to regex
-    regexPattern.replace(".", "\\.");
-    regexPattern.replace("**", ".*");
-    regexPattern.replace("*", "[^/]*");
-    regexPattern.replace("?", "[^/]");
-    
-    // Match against full path or filename
-    QRegularExpression regex("(^|/)" + regexPattern + "($|/)");
-    return regex.match(path).hasMatch() || 
-           regex.match(QFileInfo(path).fileName()).hasMatch();
-}
-
-void FileCrawler::loadGitignore(const QString& dirPath) {
-    QString gitignorePath = dirPath + "/.gitignore";
-    QFile file(gitignorePath);
-    
-    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QStringList patterns;
-        QTextStream in(&file);
-        while (!in.atEnd()) {
-            QString line = in.readLine().trimmed();
-            
-            // Skip empty lines and comments
-            if (line.isEmpty() || line.startsWith('#')) {
+        const QFileInfoList entries = QDir(dirPath).entryInfoList(
+            QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name | QDir::DirsFirst);
+        for (const QFileInfo& entry : entries) {
+            if (promise && promise->isCanceled()) break;
+            const QString rel = relDir.isEmpty() ? entry.fileName() : relDir + u'/' + entry.fileName();
+            const bool isDir = entry.isDir();
+            if (ignoredBy(layers, rel, isDir)) continue;
+            if (isDir) {
+                if (!entry.isSymLink()) walk(entry.absoluteFilePath(), rel);  // symlinks could loop forever
                 continue;
             }
-            
-            // Remove leading slash (absolute patterns become relative to gitignore location)
-            if (line.startsWith('/')) {
-                line = line.mid(1);
-            }
-            
-            patterns.append(line);
+            ++result.totalFiles;
+            if (languages.byPath(rel) && entry.size() <= options.maxFileSize &&
+                !FileCrawler::isBinaryFile(entry.absoluteFilePath()))
+                result.files.append(entry.absoluteFilePath());
+            if (promise) promise->setProgressValue(result.totalFiles);
         }
-        file.close();
-        
-        // Store patterns associated with this directory
-        if (!patterns.isEmpty()) {
-            m_gitignoreByDir[dirPath] = patterns;
-        }
+        if (pushed) layers.removeLast();
     }
+};
+
+FileCrawler::Result runScan(const FileCrawler::Options& options, QPromise<FileCrawler::Result>* promise) {
+    Walker walker{options, promise, {{QString(), compileRules(options.ignorePatterns)}}, {}};
+    const QDir root(options.rootPath);
+    if (!options.rootPath.isEmpty() && root.exists()) walker.walk(root.absolutePath(), QString());
+    return std::move(walker.result);
+}
+} // namespace
+
+QStringList FileCrawler::defaultIgnorePatterns() {
+    return {".git", ".svn", ".hg", ".bzr", "node_modules", "vendor", "build", "dist", "out", "bin", "obj",
+            "target", ".idea", ".vscode", ".vs", "__pycache__", ".comment-explorer-backups", "*.pyc", "*.pyo",
+            ".DS_Store", "Thumbs.db", "*.min.js", "*.min.css", "*.map", "*.lock", "package-lock.json", "*.log"};
 }
 
-bool FileCrawler::isCodeFile(const QString& filePath) const {
-    QFileInfo fi(filePath);
-    QString ext = fi.suffix().toLower();
-    
-    // Check include filter if set
-    {
-        QMutexLocker locker(&m_mutex);
-        if (!m_includeExtensions.isEmpty()) {
-            return m_includeExtensions.contains(ext);
-        }
-    }
-    
-    // Check language registry using full path to support extension-less/special-name files
-    return LanguageRegistry::instance().getLanguageByPath(filePath) != nullptr;
+QFuture<FileCrawler::Result> FileCrawler::scan(const Options& options) {
+    return QtConcurrent::run([](QPromise<Result>& promise, const Options& opts) {
+        promise.addResult(runScan(opts, &promise));
+    }, options);
+}
+
+FileCrawler::Result FileCrawler::scanBlocking(const Options& options) { return runScan(options, nullptr); }
+
+bool FileCrawler::isIgnored(const QString& relativePath, bool isDir, const QStringList& patterns) {
+    return ignoredBy({{QString(), compileRules(patterns)}}, relativePath, isDir);
 }
 
 bool FileCrawler::isBinaryFile(const QString& filePath) {
     QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return true;  // Can't open, treat as binary
-    }
-    
-    // Read first 8KB to check for binary content
-    QByteArray data = file.read(8192);
-    file.close();
-    
-    if (data.isEmpty()) {
-        return false;  // Empty file is not binary
-    }
-    
-    // Check for null bytes (strong indicator of binary)
-    if (data.contains('\0')) {
-        return true;
-    }
-    
-    // Check ratio of non-printable characters
-    int nonPrintable = 0;
-    for (char c : data) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        // Allow common control characters (tab, newline, carriage return)
-        if (uc < 32 && uc != 9 && uc != 10 && uc != 13) {
-            nonPrintable++;
-        }
-        // Also check for high non-UTF8 bytes
-        if (uc >= 128 && uc < 192) {
-            // Could be valid UTF-8 continuation byte, check context
-            // For simplicity, we'll allow these
-        }
-    }
-    
-    // If more than 10% non-printable, consider binary
-    double ratio = static_cast<double>(nonPrintable) / data.size();
-    return ratio > 0.1;
+    if (!file.open(QIODevice::ReadOnly)) return true;
+    const QByteArray head = file.read(8192);
+    if (head.contains('\0')) return true;
+    const auto control = std::count_if(head.begin(), head.end(), [](char ch) {
+        const auto c = static_cast<unsigned char>(ch);
+        return c < 32 && c != '\t' && c != '\n' && c != '\r' && c != '\f';
+    });
+    return control * 10 > head.size();  // more than 10% control characters
 }

@@ -4,20 +4,14 @@
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
-    
-    // Application metadata
     QCoreApplication::setOrganizationName("CommentExplorer");
     QCoreApplication::setApplicationName("Comment Explorer & Cleaner");
-    QCoreApplication::setApplicationVersion("1.0.0");
-    
-    // Set modern style
+    QCoreApplication::setApplicationVersion(APP_VERSION);
     app.setStyle(QStyleFactory::create("Fusion"));
-    
-    // Create and show main window
-    MainWindow mainWindow;
-    mainWindow.setWindowTitle("Comment Explorer & Cleaner");
-    mainWindow.resize(1400, 900);
-    mainWindow.show();
-    
+
+    MainWindow window;
+    window.setWindowTitle(QCoreApplication::applicationName());
+    window.resize(1400, 900);
+    window.show();
     return app.exec();
 }

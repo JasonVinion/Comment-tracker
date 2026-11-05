@@ -2,85 +2,46 @@
 #define SETTINGS_DIALOG_H
 
 #include <QDialog>
-#include <QCheckBox>
-#include <QSpinBox>
-#include <QLineEdit>
-#include <QListWidget>
-#include <QComboBox>
-#include <QSettings>
+#include <QStringList>
 
-/**
- * @brief Settings dialog for configuring the application
- */
+class QCheckBox;
+class QComboBox;
+class QLineEdit;
+class QListWidget;
+class QSpinBox;
+
+/// Application settings persisted with QSettings. Missing values fall back to defaults().
+struct AppSettings {
+    QStringList ignorePatterns;
+    bool useGitignore = true;
+    int contextLines = 2;        // lines of code around each group in the harvest report
+    QStringList keywords;
+    int parserMethod = 0;        // CommentExtractor::ParserMethod (0 = lexer, 1 = Tree-sitter)
+    bool backupsEnabled = true;
+    QString backupDirectory;     // empty = next to each modified file
+
+    static AppSettings defaults();
+    static AppSettings load();
+    void save() const;
+};
+
 class SettingsDialog : public QDialog {
     Q_OBJECT
-    
+
 public:
     explicit SettingsDialog(QWidget* parent = nullptr);
-    ~SettingsDialog() = default;
-    
-    // Ignore patterns
-    QStringList ignorePatterns() const;
-    void setIgnorePatterns(const QStringList& patterns);
-    
-    // Gitignore
-    bool useGitignore() const;
-    void setUseGitignore(bool use);
-    
-    // Context lines
-    int contextLines() const;
-    void setContextLines(int lines);
-    
-    // Backups
-    bool backupsEnabled() const;
-    void setBackupsEnabled(bool enabled);
-    QString backupDirectory() const;
-    void setBackupDirectory(const QString& path);
-    
-    // Keywords
-    QStringList keywords() const;
-    void setKeywords(const QStringList& keywords);
-    
-    // Parser method
-    enum class ParserMethod { Lexer, TreeSitter };
-    ParserMethod parserMethod() const;
-    void setParserMethod(ParserMethod method);
-    
-    // Load/save settings
-    void loadSettings();
-    void saveSettings();
-    
-private slots:
-    void onAddIgnorePattern();
-    void onRemoveIgnorePattern();
-    void onAddKeyword();
-    void onRemoveKeyword();
-    void onBrowseBackupDir();
-    void onResetDefaults();
-    
+
+    void setValues(const AppSettings& settings);
+    AppSettings values() const;
+
 private:
-    void setupUI();
-    
-    // Ignore patterns
-    QListWidget* m_ignorePatternsEdit;
-    QCheckBox* m_useGitignoreCheck;
-    
-    // Context
-    QSpinBox* m_contextLinesSpin;
-    
-    // Backups
-    QCheckBox* m_backupsEnabledCheck;
-    QLineEdit* m_backupDirEdit;
-    
-    // Keywords
-    QListWidget* m_keywordsEdit;
-    
-    // Parser method
-    QComboBox* m_parserMethodCombo;
-    
-    // Default values
-    static const QStringList DEFAULT_IGNORE_PATTERNS;
-    static const QStringList DEFAULT_KEYWORDS;
+    QListWidget* m_ignorePatterns;
+    QCheckBox* m_useGitignore;
+    QListWidget* m_keywords;
+    QSpinBox* m_contextLines;
+    QComboBox* m_parserMethod;
+    QCheckBox* m_backupsEnabled;
+    QLineEdit* m_backupDir;
 };
 
 #endif // SETTINGS_DIALOG_H

@@ -1,85 +1,60 @@
 #include <QtTest/QtTest>
+#include <QtConcurrent>
 #include "CommentExtractor.h"
-#include "LanguageRegistry.h"
 
 class TestTreeSitter : public QObject {
     Q_OBJECT
 
+    CommentExtractor m_extractor;
+
+    QVector<Comment> extract(const QString& code, const QString& language) {
+        m_extractor.setParserMethod(CommentExtractor::ParserMethod::TreeSitter);
+        return m_extractor.extractFromContent(code, language);
+    }
+
 private slots:
-    void initTestCase();
-    void cleanupTestCase();
+    void testJsonExtraction() {
+        auto comments = extract("{\n    // Comment\n    \"key\": \"value\" /* Block */\n}\n", "JSONC");
+        QCOMPARE(comments.size(), 2);
+        QCOMPARE(comments[0].cleanText(), QString("Comment"));
+        QCOMPARE(comments[1].cleanText(), QString("Block"));
+        QCOMPARE(comments[1].type, Comment::Type::Inline);
+    }
 
-    void testJsonExtraction();
-    void testCppExtraction();
-    void testPythonExtraction();
-    void testJavaScriptExtraction();
+    void testCppExtraction() {
+        auto comments = extract("int main() {\n    // Return 0\n    return 0; /* Exit */\n}\n", "C/C++");
+        QCOMPARE(comments.size(), 2);
+        QCOMPARE(comments[0].cleanText(), QString("Return 0"));
+        QCOMPARE(comments[0].startLine, 2);
+        QCOMPARE(comments[0].startColumn, 4);
+        QCOMPARE(comments[1].cleanText(), QString("Exit"));
+    }
 
-private:
-    CommentExtractor* extractor;
+    void testPythonExtraction() {
+        auto comments = extract("def main():\n    \"\"\"Docstring.\"\"\"\n    # Print hello\n    print(\"Hello\")\n",
+                                "Python");
+        QCOMPARE(comments.size(), 2);
+        QCOMPARE(comments[0].type, Comment::Type::DocComment);
+        QCOMPARE(comments[0].cleanText(), QString("Docstring."));
+        QCOMPARE(comments[1].cleanText(), QString("Print hello"));
+    }
+
+    void testJavaScriptExtraction() {
+        auto comments = extract("function main() {\n    // Log\n    console.log(\"Hello\"); /* Done */\n}\n",
+                                "JavaScript");
+        QCOMPARE(comments.size(), 2);
+        QCOMPARE(comments[0].cleanText(), QString("Log"));
+        QCOMPARE(comments[1].cleanText(), QString("Done"));
+    }
+
+    void testParsersAreThreadSafe() {
+        QVector<int> counts(64);
+        QtConcurrent::blockingMap(counts, [this](int& count) {
+            count = int(m_extractor.extractFromContent("// a\nint x; /* b */\n", "C/C++").size());
+        });
+        QVERIFY(std::all_of(counts.begin(), counts.end(), [](int c) { return c == 2; }));
+    }
 };
 
-void TestTreeSitter::initTestCase() {
-    extractor = new CommentExtractor();
-    extractor->setParserMethod(CommentExtractor::ParserMethod::TreeSitter);
-}
-
-void TestTreeSitter::cleanupTestCase() {
-    delete extractor;
-}
-
-void TestTreeSitter::testJsonExtraction() {
-    QString code = R"(
-{
-    // Comment
-    "key": "value" /* Block */
-}
-)";
-    auto comments = extractor->extractFromContent(code, "JSONC");
-
-    QCOMPARE(comments.size(), 2);
-    QVERIFY(comments[0].cleanText.contains("Comment"));
-    QVERIFY(comments[1].cleanText.contains("Block"));
-}
-
-void TestTreeSitter::testCppExtraction() {
-    QString code = R"(
-int main() {
-    // Return 0
-    return 0; /* Exit */
-}
-)";
-    auto comments = extractor->extractFromContent(code, "C/C++");
-
-    QCOMPARE(comments.size(), 2);
-    QVERIFY(comments[0].cleanText.contains("Return 0"));
-    QVERIFY(comments[1].cleanText.contains("Exit"));
-}
-
-void TestTreeSitter::testPythonExtraction() {
-    QString code = R"(
-def main():
-    # Print hello
-    print("Hello")
-)";
-    auto comments = extractor->extractFromContent(code, "Python");
-
-    QCOMPARE(comments.size(), 1);
-    QVERIFY(comments[0].cleanText.contains("Print hello"));
-}
-
-void TestTreeSitter::testJavaScriptExtraction() {
-    QString code = R"(
-function main() {
-    // Log
-    console.log("Hello"); /* Done */
-}
-)";
-    auto comments = extractor->extractFromContent(code, "JavaScript");
-
-    QCOMPARE(comments.size(), 2);
-    QVERIFY(comments[0].cleanText.contains("Log"));
-    QVERIFY(comments[1].cleanText.contains("Done"));
-}
-
-QTEST_MAIN(TestTreeSitter)
+QTEST_GUILESS_MAIN(TestTreeSitter)
 #include "test_TreeSitter.moc"

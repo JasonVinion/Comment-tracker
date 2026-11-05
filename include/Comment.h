@@ -2,99 +2,46 @@
 #define COMMENT_H
 
 #include <QString>
-#include <QVector>
+#include <QStringList>
 
-/**
- * @brief Represents a single comment extracted from source code
- */
+/// A single comment extracted from a source file.
+/// Kept deliberately small: path/language strings are implicitly shared between all
+/// comments of a file, and the "clean" text is a view into rawText rather than a copy.
 struct Comment {
-    // File information
-    QString filePath;           // Absolute file path
-    QString relativePath;       // Relative to scan root
-    QString language;           // Detected language (e.g., "C++", "Python")
-    
-    // Position information
-    int startLine = 0;          // 1-based line number
-    int startColumn = 0;        // 0-based column
-    int endLine = 0;            // 1-based line number
-    int endColumn = 0;          // 0-based column
-    
-    // Comment content
-    QString rawText;            // The comment text as it appears in file
-    QString cleanText;          // Comment text without delimiters
-    QString fullLines;          // Full line(s) containing the comment
-    
-    // Comment type
-    enum class Type {
-        SingleLine,             // // or # style
-        MultiLine,              // /* */ style
-        DocComment,             // /** */ or /// style
-        Inline                  // Code followed by comment on same line
-    };
-    Type type = Type::SingleLine;
-    
-    // Keyword tags detected
-    QStringList keywords;       // TODO, FIXME, NOTE, HACK, etc.
-    
-    // Context
-    QString contextBefore;      // Lines before the comment
-    QString contextAfter;       // Lines after the comment
-    
-    // For inline comments: the code portion of the line
-    QString codeSegment;
-    QString commentSegment;
-    
-    // Extraction method
-    bool isFromFallback = false; // True if extracted via regex fallback
-    
-    // Selection state (for UI)
-    bool isSelected = false;
-    
-    // Unique identifier
+    enum class Type : quint8 { SingleLine, MultiLine, DocComment, Inline };
+
+    QString filePath;      // absolute path
+    QString relativePath;  // relative to the scan root
+    QString language;      // language name from the registry
+    QString rawText;       // the comment exactly as it appears in the file
+    QStringList keywords;  // detected tags (TODO, FIXME, ...)
     int id = 0;
-    
-    /**
-     * @brief Returns a preview of the comment (first N characters)
-     */
+    int startLine = 0, startColumn = 0;  // 1-based line, 0-based column
+    int endLine = 0, endColumn = 0;      // end column is exclusive
+    int cleanStart = 0, cleanLength = 0; // rawText span without delimiters and outer whitespace
+    Type type = Type::SingleLine;
+    bool isSelected = false;
+
+    QStringView cleanView() const { return QStringView(rawText).mid(cleanStart, cleanLength); }
+    QString cleanText() const { return cleanView().toString(); }
+
     QString preview(int maxLength = 50) const {
-        QString text = cleanText.simplified();
-        if (text.length() > maxLength) {
-            return text.left(maxLength - 3) + "...";
-        }
-        return text;
+        // Only simplify a bounded prefix so huge block comments stay cheap to display.
+        QString text = cleanView().left(maxLength * 4).toString().simplified();
+        return text.size() > maxLength ? text.left(maxLength - 3) + QLatin1String("...") : text;
     }
-    
-    /**
-     * @brief Returns the type as a string
-     */
+
     QString typeString() const {
         switch (type) {
-            case Type::SingleLine: return "Line";
-            case Type::MultiLine: return "Block";
-            case Type::DocComment: return "Doc";
-            case Type::Inline: return "Inline";
+            case Type::SingleLine: return QStringLiteral("Line");
+            case Type::MultiLine: return QStringLiteral("Block");
+            case Type::DocComment: return QStringLiteral("Doc");
+            case Type::Inline: return QStringLiteral("Inline");
         }
-        return "Unknown";
+        return QStringLiteral("Unknown");
     }
-    
-    /**
-     * @brief Returns keywords as comma-separated string
-     */
-    QString keywordsString() const {
-        return keywords.join(", ");
-    }
-};
 
-/**
- * @brief Collection of comments with metadata
- */
-struct CommentCollection {
-    QVector<Comment> comments;
-    QString rootPath;
-    int totalFilesScanned = 0;
-    int codeFilesFound = 0;
-    int skippedFiles = 0;
-    QStringList errors;
+    QString keywordsString() const { return keywords.join(QLatin1String(", ")); }
 };
 
 #endif // COMMENT_H

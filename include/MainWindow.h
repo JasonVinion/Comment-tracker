@@ -1,165 +1,108 @@
 #ifndef MAIN_WINDOW_H
 #define MAIN_WINDOW_H
 
-#include <QMainWindow>
-#include <QTableView>
-#include <QTreeView>
-#include <QProgressBar>
-#include <QLabel>
-#include <QPushButton>
-#include <QLineEdit>
-#include <QComboBox>
-#include <QCheckBox>
-#include <QSplitter>
-#include <QThread>
 #include <QFutureWatcher>
-#include <QFuture>
-#include <memory>
-#include <atomic>
+#include <QMainWindow>
+#include <QMutex>
+#include <QTimer>
+#include "CommentExtractor.h"
+#include "EditPlanner.h"
+#include "FileCrawler.h"
+#include "FileWriter.h"
 
-#include "Comment.h"
-#include "CommentModel.h"
-#include "DiffPreview.h"
+class CommentFilterProxy;
+class CommentModel;
+class DiffPreview;
+class QAction;
+class QCheckBox;
+class QComboBox;
+class QLabel;
+class QLineEdit;
+class QMenu;
+class QProgressBar;
+class QPushButton;
+class QTableView;
 
-class FileCrawler;
-class CommentExtractor;
-class EditPlanner;
-class FileWriter;
-class SettingsDialog;
-
-/**
- * @brief Main application window
- * 
- * Provides the primary user interface for:
- * - Folder selection and scanning
- * - Comment list display and filtering
- * - Preview panes for before/after deletion
- * - Action buttons for deletion and application
- */
+/// Main window: folder scanning, the comment table with filters, the
+/// before/after preview and the delete / apply / discard workflow.
 class MainWindow : public QMainWindow {
     Q_OBJECT
-    
+
 public:
     explicit MainWindow(QWidget* parent = nullptr);
-    ~MainWindow();
-    
-private slots:
-    // File operations
-    void onSelectFolder();
-    void onRescan();
-    void onCancelScan();
-    
-    // Scan callbacks
-    void onFileFound(const QString& filePath);
-    void onScanProgress(int filesScanned, int codeFilesFound, const QString& currentPath);
-    void onScanComplete(int totalFiles, int codeFiles);
-    void onScanError(const QString& message);
-    
-    // Comment extraction
-    void onExtractionComplete();
-    
-    // Selection and filtering
-    void onCommentSelected(const QModelIndex& current, const QModelIndex& previous);
-    void onSearchTextChanged(const QString& text);
-    void onKeywordFilterChanged();
-    void onLanguageFilterChanged(const QString& language);
-    void onRegexToggled(bool checked);
-    void onClearFilters();
-    void onCustomFilter();
-    
-    // Deletion operations
-    void onDeleteSelected();
-    void onPreviewDeletion();
-    void onApplyChanges();
-    void onDiscardChanges();
-    
-    // Menu actions
-    void onSettings();
-    void onExportComments();
-    void onHarvestSpecialComments();
-    void onExportAuditLog();
-    void onAbout();
-    
-    // Selection
-    void onSelectAll();
-    void onDeselectAll();
-    
+    ~MainWindow() override;
+
 private:
-    void setupUI();
-    void setupMenuBar();
-    void setupToolBar();
-    void setupStatusBar();
-    void setupConnections();
-    
-    void updateStatusBar();
-    void updatePreview();
-    void updateActionStates();
-    
-    void startExtraction(const QStringList& files);
-    void processNextFile();
-    
-    // UI Components
-    QSplitter* m_mainSplitter;
-    QSplitter* m_rightSplitter;
-    
-    // Left panel - file tree (optional)
-    QTreeView* m_fileTree;
-    
-    // Center panel - comment table
-    QTableView* m_commentTable;
-    CommentModel* m_commentModel;
-    CommentFilterProxy* m_filterProxy;
-    
-    // Right panel - preview
-    DiffPreview* m_diffPreview;
-    
-    // Toolbar components
-    QPushButton* m_selectFolderBtn;
-    QPushButton* m_rescanBtn;
-    QPushButton* m_settingsBtn;
-    QPushButton* m_harvestBtn;
-    QPushButton* m_cancelBtn;
-    QLineEdit* m_searchEdit;
-    QComboBox* m_keywordFilterCombo;
-    QComboBox* m_languageFilterCombo;
+    void setupUi();
+    QAction* makeAction(QMenu* menu, const QString& text, void (MainWindow::*slot)(), const QKeySequence& shortcut = {});
+
+    // Scanning: the crawler finds files, then they are parsed in parallel.
+    void selectFolder();
+    void rescan();
+    void cancelScan();
+    void stopBackgroundWork();
+    void onScanFinished();
+    void onExtractionFinished();
+    void flushExtracted();
+
+    // Browsing and filtering
+    void showCurrentComment();
+    void showPreview(const QString& filePath, const QVector<EditRange>& ranges, const QString& language, int focusLine);
+    void updateFilter();
+    void editCustomFilter();
+    void clearFilters();
+    void selectVisible();
+    void deselectAll();
+
+    // Deleting
+    void previewDeletion();
+    void applyChanges();
+    void discardChanges();
+
+    // Other actions
+    void openSettings();
+    void exportComments();
+    void exportAuditLog();
+    void harvestSpecialComments();
+    void showAbout();
+
+    void setBusy(bool busy);
+    void updateActions();
+    QString relativePath(const QString& filePath) const;
+
+    CommentModel* m_model;
+    CommentFilterProxy* m_proxy;
+    QTableView* m_table;
+    DiffPreview* m_preview;
+    QLineEdit* m_search;
+    QComboBox* m_keywordCombo;
+    QComboBox* m_languageCombo;
     QCheckBox* m_regexCheck;
-    QPushButton* m_clearFiltersBtn;
-    QPushButton* m_customFilterBtn;
-    
-    // Action buttons
-    QPushButton* m_deleteSelectedBtn;
-    QPushButton* m_previewBtn;
+    QPushButton* m_deleteBtn;
     QPushButton* m_applyBtn;
     QPushButton* m_discardBtn;
-    
-    // Status bar
-    QProgressBar* m_progressBar;
+    QAction* m_rescanAct;
+    QAction* m_cancelAct;
+    QAction* m_harvestAct;
+    QLabel* m_pathLabel;
     QLabel* m_statusLabel;
     QLabel* m_countsLabel;
-    
-    // Core components
-    std::unique_ptr<FileCrawler> m_fileCrawler;
-    std::unique_ptr<CommentExtractor> m_extractor;
-    std::unique_ptr<EditPlanner> m_editPlanner;
-    std::unique_ptr<FileWriter> m_fileWriter;
-    
-    // State
-    QString m_rootPath;
-    QStringList m_filesToProcess;
-    int m_currentFileIndex = 0;
-    std::atomic<bool> m_isScanning{false};
-    bool m_hasPendingChanges = false;
-    QString m_customPathFilter;
-    QString m_customTypeFilter;
-    
-    // Settings
-    SettingsDialog* m_settingsDialog = nullptr;
-    
-    // Pending edits
-    QMap<QString, EditResult> m_pendingEdits;
+    QProgressBar* m_progress;
 
-    // Future for background tasks
-    QFuture<void> m_extractionFuture;
+    CommentExtractor m_extractor;
+    FileWriter m_writer;
+    QString m_rootPath;
+    QString m_customPath, m_customType;
+    EditPlan m_pendingPlan;
+    bool m_busy = false;
+
+    QFutureWatcher<FileCrawler::Result> m_scanWatcher;
+    QFutureWatcher<void> m_extractWatcher;
+    bool m_scanHandled = true, m_extractHandled = true;  // guards against late signals from cancelled runs
+    QStringList m_files;          // files being parsed (must outlive the extraction)
+    QMutex m_inboxMutex;          // parsed comments waiting to be shown
+    QVector<Comment> m_inbox;
+    QTimer m_flushTimer;
 };
 
 #endif // MAIN_WINDOW_H

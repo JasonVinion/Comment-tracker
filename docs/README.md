@@ -108,7 +108,7 @@ Access settings via Edit → Settings:
 
 - **Ignore Patterns**: Glob patterns for files/folders to skip (e.g., `node_modules`, `*.min.js`)
 - **Use .gitignore**: Automatically respect .gitignore rules
-- **Context Lines**: Number of lines shown before/after comments
+- **Context Lines**: Lines of code shown around each group in the harvest report
 - **Backups**: Enable/disable automatic backups before modifications
 - **Keywords**: Customize the list of keywords to detect (TODO, FIXME, etc.)
 
@@ -116,9 +116,10 @@ Access settings via Edit → Settings:
 
 The application is built with a modular architecture:
 
-- **FileCrawler**: Async directory traversal with progress reporting
+- **FileCrawler**: Async directory traversal with `.gitignore`-style ignore rules
 - **LanguageRegistry**: Maps extensions to comment syntax
-- **CommentExtractor**: Lexer-based comment extraction
+- **CommentExtractor**: Lexer and Tree-sitter comment extraction (thread-safe, files are parsed in parallel)
+- **TextFile**: UTF-8 file I/O that preserves line endings and BOM
 - **CommentModel**: Qt model for the comment table
 - **EditPlanner**: Computes safe comment deletions
 - **FileWriter**: Atomic writes with backups
@@ -130,11 +131,11 @@ The application supports two extraction methods, configurable in Settings:
 
 1. **Lexer-based (Fast)**: The default method. Uses a custom lexer that properly handles strings, regex literals, and raw strings to avoid false positives. Fast and reliable for most use cases.
 
-2. **Tree-sitter (Accurate)**: Parser-based extraction using Tree-sitter grammars. Fully implemented for supported languages (JSON, C/C++, Python, JavaScript/TypeScript). More accurate for complex language constructs.
+2. **Tree-sitter (Accurate)**: Parser-based extraction using Tree-sitter grammars. Used for JSON, C/C++, Python and JavaScript. Other languages, and files the grammar cannot parse (such as TypeScript type annotations), fall back to the lexer automatically.
 
 ## Known Limitations
 
-1. **Regex Literals**: JavaScript/TypeScript regex literal detection in Lexer mode is heuristic-based (use Tree-sitter for full accuracy).
+1. **Regex Literals**: JavaScript/TypeScript regex literal detection in Lexer mode is heuristic-based (use Tree-sitter for JavaScript).
 
 2. **Template Strings**: Multi-line template literals may not be fully handled in all cases in Lexer mode.
 

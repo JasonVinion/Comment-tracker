@@ -1,968 +1,566 @@
 #include "MainWindow.h"
-#include "FileCrawler.h"
-#include "CommentExtractor.h"
-#include "EditPlanner.h"
-#include "FileWriter.h"
+#include "CommentModel.h"
+#include "DiffPreview.h"
 #include "SettingsDialog.h"
-
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QToolBar>
-#include <QMenuBar>
-#include <QMenu>
-#include <QAction>
-#include <QFileDialog>
-#include <QMessageBox>
-#include <QHeaderView>
-#include <QSettings>
-#include <QtConcurrent>
 #include <QApplication>
-#include <QClipboard>
-#include <QTextStream>
-#include <QStatusBar>
-#include <QDialog>
-#include <QDialogButtonBox>
-#include <QFormLayout>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QHeaderView>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QSplitter>
+#include <QStatusBar>
+#include <QTableView>
+#include <QTextStream>
+#include <QToolBar>
+#include <QVBoxLayout>
+#include <QtConcurrent>
 
-MainWindow::MainWindow(QWidget* parent)
-    : QMainWindow(parent)
-    , m_fileCrawler(std::make_unique<FileCrawler>())
-    , m_extractor(std::make_unique<CommentExtractor>())
-    , m_editPlanner(std::make_unique<EditPlanner>())
-    , m_fileWriter(std::make_unique<FileWriter>()) {
-    setupUI();
-    setupMenuBar();
-    setupToolBar();
-    setupStatusBar();
-    setupConnections();
-    updateActionStates();
-}
-
-MainWindow::~MainWindow() = default;
-
-void MainWindow::setupUI() {
-    QWidget* central = new QWidget(this);
-    setCentralWidget(central);
-    
-    QVBoxLayout* mainLayout = new QVBoxLayout(central);
-    mainLayout->setContentsMargins(5, 5, 5, 5);
-    
-    // Main content splitter
-    m_mainSplitter = new QSplitter(Qt::Horizontal, this);
-    
-    // Left panel - Comment table
-    QWidget* leftPanel = new QWidget();
-    QVBoxLayout* leftLayout = new QVBoxLayout(leftPanel);
-    leftLayout->setContentsMargins(0, 0, 0, 0);
-    
-    // Filter bar
-    QHBoxLayout* filterLayout = new QHBoxLayout();
-    
-    m_searchEdit = new QLineEdit();
-    m_searchEdit->setPlaceholderText("Search comments...");
-    m_searchEdit->setClearButtonEnabled(true);
-    filterLayout->addWidget(m_searchEdit, 1);
-    
-    m_keywordFilterCombo = new QComboBox();
-    m_keywordFilterCombo->addItem("All Keywords");
-    m_keywordFilterCombo->addItem("TODO");
-    m_keywordFilterCombo->addItem("FIXME");
-    m_keywordFilterCombo->addItem("HACK");
-    m_keywordFilterCombo->addItem("NOTE");
-    m_keywordFilterCombo->addItem("BUG");
-    filterLayout->addWidget(m_keywordFilterCombo);
-    
-    m_languageFilterCombo = new QComboBox();
-    m_languageFilterCombo->addItem("All Languages");
-    filterLayout->addWidget(m_languageFilterCombo);
-    
-    m_regexCheck = new QCheckBox("Regex");
-    filterLayout->addWidget(m_regexCheck);
-
-    m_customFilterBtn = new QPushButton("Custom Filter...");
-    filterLayout->addWidget(m_customFilterBtn);
-    
-    m_clearFiltersBtn = new QPushButton("Clear");
-    filterLayout->addWidget(m_clearFiltersBtn);
-    
-    leftLayout->addLayout(filterLayout);
-    
-    // Comment table
-    m_commentTable = new QTableView();
-    m_commentModel = new CommentModel(this);
-    m_filterProxy = new CommentFilterProxy(this);
-    m_filterProxy->setSourceModel(m_commentModel);
-    m_commentTable->setModel(m_filterProxy);
-    
-    m_commentTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_commentTable->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_commentTable->setAlternatingRowColors(true);
-    m_commentTable->setSortingEnabled(true);
-    m_commentTable->horizontalHeader()->setStretchLastSection(true);
-    m_commentTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-    m_commentTable->verticalHeader()->setVisible(false);
-    
-    // Set column widths
-    m_commentTable->setColumnWidth(CommentModel::ColFile, 200);
-    m_commentTable->setColumnWidth(CommentModel::ColLine, 50);
-    m_commentTable->setColumnWidth(CommentModel::ColType, 60);
-    m_commentTable->setColumnWidth(CommentModel::ColKeywords, 80);
-    m_commentTable->setColumnWidth(CommentModel::ColLanguage, 80);
-    
-    leftLayout->addWidget(m_commentTable);
-    
-    // Selection buttons
-    QHBoxLayout* selectionLayout = new QHBoxLayout();
-    QPushButton* selectAllBtn = new QPushButton("Select All");
-    QPushButton* deselectAllBtn = new QPushButton("Deselect All");
-    m_deleteSelectedBtn = new QPushButton("Delete Selected");
-    m_deleteSelectedBtn->setEnabled(false);
-    
-    selectionLayout->addWidget(selectAllBtn);
-    selectionLayout->addWidget(deselectAllBtn);
-    selectionLayout->addStretch();
-    selectionLayout->addWidget(m_deleteSelectedBtn);
-    
-    leftLayout->addLayout(selectionLayout);
-    
-    connect(selectAllBtn, &QPushButton::clicked, this, &MainWindow::onSelectAll);
-    connect(deselectAllBtn, &QPushButton::clicked, this, &MainWindow::onDeselectAll);
-    
-    m_mainSplitter->addWidget(leftPanel);
-    
-    // Right panel - Preview
-    QWidget* rightPanel = new QWidget();
-    QVBoxLayout* rightLayout = new QVBoxLayout(rightPanel);
-    rightLayout->setContentsMargins(0, 0, 0, 0);
-    
-    m_diffPreview = new DiffPreview(this);
-    rightLayout->addWidget(m_diffPreview);
-    
-    // Action buttons
-    QHBoxLayout* actionLayout = new QHBoxLayout();
-    m_previewBtn = new QPushButton("Preview Changes");
-    m_applyBtn = new QPushButton("Apply Changes");
-    m_discardBtn = new QPushButton("Discard");
-    
-    m_previewBtn->setEnabled(false);
-    m_applyBtn->setEnabled(false);
-    m_discardBtn->setEnabled(false);
-    
-    actionLayout->addWidget(m_previewBtn);
-    actionLayout->addWidget(m_applyBtn);
-    actionLayout->addWidget(m_discardBtn);
-    
-    rightLayout->addLayout(actionLayout);
-    
-    m_mainSplitter->addWidget(rightPanel);
-    
-    // Set splitter sizes
-    m_mainSplitter->setSizes({600, 400});
-    
-    mainLayout->addWidget(m_mainSplitter);
-}
-
-void MainWindow::setupMenuBar() {
-    QMenuBar* menuBar = this->menuBar();
-    
-    // File menu
-    QMenu* fileMenu = menuBar->addMenu("&File");
-    
-    QAction* openAction = fileMenu->addAction("&Open Folder...");
-    openAction->setShortcut(QKeySequence::Open);
-    connect(openAction, &QAction::triggered, this, &MainWindow::onSelectFolder);
-    
-    fileMenu->addSeparator();
-    
-    QAction* exportAction = fileMenu->addAction("&Export Comments...");
-    connect(exportAction, &QAction::triggered, this, &MainWindow::onExportComments);
-    
-    QAction* harvestAction = fileMenu->addAction("&Harvest Special Comments...");
-    connect(harvestAction, &QAction::triggered, this, &MainWindow::onHarvestSpecialComments);
-    
-    QAction* exportLogAction = fileMenu->addAction("Export Audit &Log...");
-    connect(exportLogAction, &QAction::triggered, this, &MainWindow::onExportAuditLog);
-    
-    fileMenu->addSeparator();
-    
-    QAction* exitAction = fileMenu->addAction("E&xit");
-    exitAction->setShortcut(QKeySequence::Quit);
-    connect(exitAction, &QAction::triggered, this, &QMainWindow::close);
-    
-    // Edit menu
-    QMenu* editMenu = menuBar->addMenu("&Edit");
-    
-    QAction* settingsAction = editMenu->addAction("&Settings...");
-    connect(settingsAction, &QAction::triggered, this, &MainWindow::onSettings);
-    
-    // View menu
-    QMenu* viewMenu = menuBar->addMenu("&View");
-    
-    QAction* rescanAction = viewMenu->addAction("&Rescan");
-    rescanAction->setShortcut(QKeySequence::Refresh);
-    connect(rescanAction, &QAction::triggered, this, &MainWindow::onRescan);
-    
-    // Help menu
-    QMenu* helpMenu = menuBar->addMenu("&Help");
-    
-    QAction* aboutAction = helpMenu->addAction("&About");
-    connect(aboutAction, &QAction::triggered, this, &MainWindow::onAbout);
-}
-
-void MainWindow::setupToolBar() {
-    QToolBar* toolbar = addToolBar("Main");
-    toolbar->setMovable(false);
-    
-    m_selectFolderBtn = new QPushButton("Select Folder");
-    toolbar->addWidget(m_selectFolderBtn);
-    
-    m_rescanBtn = new QPushButton("Rescan");
-    m_rescanBtn->setEnabled(false);
-    toolbar->addWidget(m_rescanBtn);
-
-    m_settingsBtn = new QPushButton("Settings");
-    toolbar->addWidget(m_settingsBtn);
-    
-    m_harvestBtn = new QPushButton("Harvest Comments");
-    m_harvestBtn->setEnabled(false);
-    toolbar->addWidget(m_harvestBtn);
-    connect(m_harvestBtn, &QPushButton::clicked, this, &MainWindow::onHarvestSpecialComments);
-    
-    m_cancelBtn = new QPushButton("Cancel");
-    m_cancelBtn->setEnabled(false);
-    toolbar->addWidget(m_cancelBtn);
-    
-    toolbar->addSeparator();
-    
-    QLabel* rootLabel = new QLabel("Root: ");
-    toolbar->addWidget(rootLabel);
-    
-    QLabel* pathLabel = new QLabel("(none selected)");
-    pathLabel->setObjectName("pathLabel");
-    toolbar->addWidget(pathLabel);
-}
-
-void MainWindow::setupStatusBar() {
-    m_statusLabel = new QLabel("Ready");
-    statusBar()->addWidget(m_statusLabel, 1);
-    
-    m_countsLabel = new QLabel();
-    statusBar()->addPermanentWidget(m_countsLabel);
-    
-    m_progressBar = new QProgressBar();
-    m_progressBar->setMaximumWidth(200);
-    m_progressBar->setVisible(false);
-    statusBar()->addPermanentWidget(m_progressBar);
-}
-
-void MainWindow::setupConnections() {
-    // Toolbar buttons
-    connect(m_selectFolderBtn, &QPushButton::clicked, this, &MainWindow::onSelectFolder);
-    connect(m_rescanBtn, &QPushButton::clicked, this, &MainWindow::onRescan);
-    connect(m_cancelBtn, &QPushButton::clicked, this, &MainWindow::onCancelScan);
-    connect(m_settingsBtn, &QPushButton::clicked, this, &MainWindow::onSettings);
-    
-    // FileCrawler signals
-    connect(m_fileCrawler.get(), &FileCrawler::fileFound, this, &MainWindow::onFileFound);
-    connect(m_fileCrawler.get(), &FileCrawler::progress, this, &MainWindow::onScanProgress);
-    connect(m_fileCrawler.get(), &FileCrawler::scanComplete, this, &MainWindow::onScanComplete);
-    connect(m_fileCrawler.get(), &FileCrawler::error, this, &MainWindow::onScanError);
-    
-    // Comment table selection
-    connect(m_commentTable->selectionModel(), &QItemSelectionModel::currentChanged,
-            this, &MainWindow::onCommentSelected);
-    
-    // Filter controls
-    connect(m_searchEdit, &QLineEdit::textChanged, this, &MainWindow::onSearchTextChanged);
-    connect(m_keywordFilterCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &MainWindow::onKeywordFilterChanged);
-    connect(m_languageFilterCombo, &QComboBox::currentTextChanged,
-            this, &MainWindow::onLanguageFilterChanged);
-    connect(m_regexCheck, &QCheckBox::toggled, this, &MainWindow::onRegexToggled);
-    connect(m_clearFiltersBtn, &QPushButton::clicked, this, &MainWindow::onClearFilters);
-    connect(m_customFilterBtn, &QPushButton::clicked, this, &MainWindow::onCustomFilter);
-    
-    // Action buttons
-    connect(m_deleteSelectedBtn, &QPushButton::clicked, this, &MainWindow::onDeleteSelected);
-    connect(m_previewBtn, &QPushButton::clicked, this, &MainWindow::onPreviewDeletion);
-    connect(m_applyBtn, &QPushButton::clicked, this, &MainWindow::onApplyChanges);
-    connect(m_discardBtn, &QPushButton::clicked, this, &MainWindow::onDiscardChanges);
-    
-    // Model signals
-    connect(m_commentModel, &CommentModel::selectionChanged,
-            this, [this](int selected, int total) {
-                m_deleteSelectedBtn->setEnabled(selected > 0);
-                m_countsLabel->setText(QString("Selected: %1 / %2").arg(selected).arg(total));
-            });
-}
-
-void MainWindow::onSelectFolder() {
-    QString dir = QFileDialog::getExistingDirectory(this, "Select Folder to Scan",
-        m_rootPath.isEmpty() ? QDir::homePath() : m_rootPath);
-    
-    if (!dir.isEmpty()) {
-        m_rootPath = dir;
-        
-        // Update path label
-        QLabel* pathLabel = findChild<QLabel*>("pathLabel");
-        if (pathLabel) {
-            pathLabel->setText(m_rootPath);
-        }
-        
-        m_rescanBtn->setEnabled(true);
-        onRescan();
-    }
-}
-
-void MainWindow::onRescan() {
-    if (m_rootPath.isEmpty()) {
-        return;
-    }
-    
-    // Clear existing data
-    m_commentModel->clear();
-    m_filesToProcess.clear();
-    m_currentFileIndex = 0;
-    m_pendingEdits.clear();
-    m_diffPreview->clear();
-    
-    // Update UI state
-    m_isScanning = true;
-    m_cancelBtn->setEnabled(true);
-    m_progressBar->setVisible(true);
-    m_progressBar->setRange(0, 0);  // Indeterminate
-    m_statusLabel->setText("Scanning...");
-    
-    // Load settings
-    QSettings settings;
-    settings.beginGroup("FileCrawler");
-    QStringList patterns = settings.value("ignorePatterns").toStringList();
-    bool useGitignore = settings.value("useGitignore", true).toBool();
-    settings.endGroup();
-    
-    // Configure and start crawler
-    m_fileCrawler->clearIgnorePatterns();
-    m_fileCrawler->addIgnorePatterns(patterns);
-    m_fileCrawler->setUseGitignore(useGitignore);
-    m_fileCrawler->setRootPath(m_rootPath);
-    m_fileCrawler->startScan();
-}
-
-void MainWindow::onCancelScan() {
-    m_fileCrawler->cancel();
-    m_isScanning = false;
-    m_cancelBtn->setEnabled(false);
-    m_progressBar->setVisible(false);
-    m_statusLabel->setText("Scan cancelled");
-}
-
-void MainWindow::onFileFound(const QString& filePath) {
-    m_filesToProcess.append(filePath);
-}
-
-void MainWindow::onScanProgress(int filesScanned, int codeFilesFound, const QString& currentPath) {
-    m_statusLabel->setText(QString("Scanning: %1 files found (%2 code files)...")
-                          .arg(filesScanned).arg(codeFilesFound));
-}
-
-void MainWindow::onScanComplete(int totalFiles, int codeFiles) {
-    m_statusLabel->setText(QString("Scan complete: %1 files, %2 code files. Extracting comments...")
-                          .arg(totalFiles).arg(codeFiles));
-    
-    // Start extraction
-    m_progressBar->setRange(0, m_filesToProcess.size());
-    m_progressBar->setValue(0);
-    
-    startExtraction(m_filesToProcess);
-}
-
-void MainWindow::onScanError(const QString& message) {
-    QMessageBox::warning(this, "Scan Error", message);
-    m_isScanning = false;
-    m_cancelBtn->setEnabled(false);
-    m_progressBar->setVisible(false);
-}
-
-void MainWindow::startExtraction(const QStringList& files) {
-    if (files.isEmpty()) {
-        onExtractionComplete();
-        return;
-    }
-    
-    // Load extractor settings
-    QSettings settings;
-    settings.beginGroup("Extractor");
-    int contextLines = settings.value("contextLines", 2).toInt();
-    QStringList keywords = settings.value("keywords").toStringList();
-    int parserMethodInt = settings.value("parserMethod", 0).toInt();
-    settings.endGroup();
-    
-    m_extractor->setContextLines(contextLines);
-    if (!keywords.isEmpty()) {
-        m_extractor->setKeywords(keywords);
-    }
-    m_extractor->setParserMethod(static_cast<CommentExtractor::ParserMethod>(parserMethodInt));
-    
-    // Process files in a background thread
-    m_extractionFuture = QtConcurrent::run([this, files]() {
-        QDir rootDir(m_rootPath);
-        
-        for (int i = 0; i < files.size(); i++) {
-            if (!m_isScanning) break;
-            
-            const QString& filePath = files[i];
-            QString relativePath = rootDir.relativeFilePath(filePath);
-            
-            QVector<Comment> comments;
-            try {
-                comments = m_extractor->extractFromFile(filePath, relativePath);
-            } catch (const std::exception& e) {
-                // Log error but continue with other files
-                qWarning() << "Failed to extract from" << filePath << ":" << e.what();
-            } catch (...) {
-                qWarning() << "Unknown error extracting from" << filePath;
-            }
-            
-            // Add to model on main thread
-            QMetaObject::invokeMethod(this, [this, comments, i, total = files.size()]() {
-                m_commentModel->addComments(comments);
-                m_progressBar->setValue(i + 1);
-                
-                if (i + 1 >= total) {
-                    onExtractionComplete();
-                }
-            }, Qt::QueuedConnection);
-        }
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    setupUi();
+    connect(&m_scanWatcher, &QFutureWatcherBase::progressValueChanged, this,
+            [this](int files) { m_statusLabel->setText(tr("Scanning: %1 files examined...").arg(files)); });
+    connect(&m_scanWatcher, &QFutureWatcherBase::finished, this, &MainWindow::onScanFinished);
+    connect(&m_extractWatcher, &QFutureWatcherBase::progressRangeChanged, m_progress, &QProgressBar::setRange);
+    connect(&m_extractWatcher, &QFutureWatcherBase::progressValueChanged, m_progress, &QProgressBar::setValue);
+    connect(&m_extractWatcher, &QFutureWatcherBase::finished, this, &MainWindow::onExtractionFinished);
+    m_flushTimer.setInterval(150);  // batch table inserts instead of one per file
+    connect(&m_flushTimer, &QTimer::timeout, this, &MainWindow::flushExtracted);
+    connect(m_model, &CommentModel::selectionChanged, this, [this](int selected, int total) {
+        m_countsLabel->setText(tr("Selected: %1 / %2").arg(selected).arg(total));
+        updateActions();
     });
+    updateActions();
 }
 
-void MainWindow::onExtractionComplete() {
-    m_isScanning = false;
-    m_cancelBtn->setEnabled(false);
-    m_progressBar->setVisible(false);
-    
-    int count = m_commentModel->totalCount();
-    m_statusLabel->setText(QString("Found %1 comments").arg(count));
-    m_countsLabel->setText(QString("Selected: 0 / %1").arg(count));
-    
-    // Populate language filter
-    m_languageFilterCombo->clear();
-    m_languageFilterCombo->addItem("All Languages");
-    QSet<QString> languages;
-    for (int i = 0; i < m_commentModel->totalCount(); i++) {
-        const Comment* c = m_commentModel->commentAt(i);
-        if (c) {
-            languages.insert(c->language);
-        }
-    }
-    QStringList langList = languages.values();
-    langList.sort();
-    m_languageFilterCombo->addItems(langList);
-    
-    updateActionStates();
+MainWindow::~MainWindow() { stopBackgroundWork(); }
+
+QAction* MainWindow::makeAction(QMenu* menu, const QString& text, void (MainWindow::*slot)(), const QKeySequence& shortcut) {
+    QAction* action = menu->addAction(text, this, slot);
+    action->setShortcut(shortcut);
+    return action;
 }
 
-void MainWindow::onCommentSelected(const QModelIndex& current, const QModelIndex& previous) {
-    Q_UNUSED(previous);
-    
-    if (!current.isValid()) {
-        m_diffPreview->clear();
+void MainWindow::setupUi() {
+    // Menus; the most common actions are also on the toolbar.
+    QMenu* fileMenu = menuBar()->addMenu(tr("&File"));
+    QAction* openAct = makeAction(fileMenu, tr("&Open Folder..."), &MainWindow::selectFolder, QKeySequence::Open);
+    fileMenu->addSeparator();
+    makeAction(fileMenu, tr("&Export Comments..."), &MainWindow::exportComments);
+    m_harvestAct = makeAction(fileMenu, tr("&Harvest Special Comments..."), &MainWindow::harvestSpecialComments);
+    makeAction(fileMenu, tr("Export Audit &Log..."), &MainWindow::exportAuditLog);
+    fileMenu->addSeparator();
+    fileMenu->addAction(tr("E&xit"), QKeySequence::Quit, this, &QWidget::close);
+    QAction* settingsAct = makeAction(menuBar()->addMenu(tr("&Edit")), tr("&Settings..."), &MainWindow::openSettings);
+    QMenu* viewMenu = menuBar()->addMenu(tr("&View"));
+    m_rescanAct = makeAction(viewMenu, tr("&Rescan"), &MainWindow::rescan, QKeySequence::Refresh);
+    m_cancelAct = makeAction(viewMenu, tr("&Cancel Scan"), &MainWindow::cancelScan, Qt::Key_Escape);
+    makeAction(menuBar()->addMenu(tr("&Help")), tr("&About"), &MainWindow::showAbout);
+
+    QToolBar* toolbar = addToolBar(tr("Main"));
+    toolbar->setMovable(false);
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    openAct->setIconText(tr("Select Folder"));
+    m_harvestAct->setIconText(tr("Harvest Comments"));
+    m_cancelAct->setIconText(tr("Cancel"));
+    toolbar->addActions({openAct, m_rescanAct, settingsAct, m_harvestAct, m_cancelAct});
+    toolbar->addSeparator();
+    toolbar->addWidget(new QLabel(tr("Root: ")));
+    toolbar->addWidget(m_pathLabel = new QLabel(tr("(none selected)")));
+
+    // Left: filters, comment table, selection buttons.
+    auto* left = new QWidget;
+    auto* leftLayout = new QVBoxLayout(left);
+    leftLayout->setContentsMargins(0, 0, 0, 0);
+    auto* filterRow = new QHBoxLayout;
+    m_search = new QLineEdit;
+    m_search->setPlaceholderText(tr("Search comments..."));
+    m_search->setClearButtonEnabled(true);
+    m_keywordCombo = new QComboBox;
+    m_keywordCombo->addItem(tr("All Keywords"));
+    m_keywordCombo->addItems(AppSettings::load().keywords);
+    m_languageCombo = new QComboBox;
+    m_languageCombo->addItem(tr("All Languages"));
+    m_regexCheck = new QCheckBox(tr("Regex"));
+    auto* customBtn = new QPushButton(tr("Custom Filter..."));
+    auto* clearBtn = new QPushButton(tr("Clear"));
+    filterRow->addWidget(m_search, 1);
+    for (QWidget* w : std::initializer_list<QWidget*>{m_keywordCombo, m_languageCombo, m_regexCheck, customBtn, clearBtn})
+        filterRow->addWidget(w);
+    leftLayout->addLayout(filterRow);
+
+    m_model = new CommentModel(this);
+    m_proxy = new CommentFilterProxy(this);
+    m_proxy->setSourceModel(m_model);
+    m_table = new QTableView;
+    m_table->setModel(m_proxy);
+    m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_table->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_table->setAlternatingRowColors(true);
+    m_table->setSortingEnabled(true);
+    m_table->sortByColumn(-1, Qt::AscendingOrder);  // keep file order until the user sorts
+    m_table->horizontalHeader()->setStretchLastSection(true);
+    m_table->verticalHeader()->setVisible(false);
+    m_table->verticalHeader()->setDefaultSectionSize(m_table->fontMetrics().height() + 6);
+    const int widths[] = {200, 50, 60, 80, 400, 80};
+    for (int col = 0; col < CommentModel::ColCount; ++col) m_table->setColumnWidth(col, widths[col]);
+    leftLayout->addWidget(m_table);
+
+    auto* selectionRow = new QHBoxLayout;
+    auto* selectAllBtn = new QPushButton(tr("Select All"));
+    selectAllBtn->setToolTip(tr("Select every comment that matches the current filters"));
+    auto* deselectAllBtn = new QPushButton(tr("Deselect All"));
+    m_deleteBtn = new QPushButton(tr("Delete Selected..."));
+    m_deleteBtn->setToolTip(tr("Preview the removal of all checked comments"));
+    selectionRow->addWidget(selectAllBtn);
+    selectionRow->addWidget(deselectAllBtn);
+    selectionRow->addStretch();
+    selectionRow->addWidget(m_deleteBtn);
+    leftLayout->addLayout(selectionRow);
+
+    // Right: preview and apply/discard.
+    auto* right = new QWidget;
+    auto* rightLayout = new QVBoxLayout(right);
+    rightLayout->setContentsMargins(0, 0, 0, 0);
+    rightLayout->addWidget(m_preview = new DiffPreview);
+    auto* actionRow = new QHBoxLayout;
+    actionRow->addStretch();
+    actionRow->addWidget(m_applyBtn = new QPushButton(tr("Apply Changes")));
+    actionRow->addWidget(m_discardBtn = new QPushButton(tr("Discard")));
+    rightLayout->addLayout(actionRow);
+
+    auto* splitter = new QSplitter(Qt::Horizontal);
+    splitter->addWidget(left);
+    splitter->addWidget(right);
+    splitter->setSizes({600, 400});
+    auto* central = new QWidget;
+    auto* centralLayout = new QVBoxLayout(central);
+    centralLayout->setContentsMargins(5, 5, 5, 5);
+    centralLayout->addWidget(splitter);
+    setCentralWidget(central);
+
+    statusBar()->addWidget(m_statusLabel = new QLabel(tr("Ready")), 1);
+    statusBar()->addPermanentWidget(m_countsLabel = new QLabel);
+    statusBar()->addPermanentWidget(m_progress = new QProgressBar);
+    m_progress->setMaximumWidth(200);
+    m_progress->setVisible(false);
+
+    connect(m_search, &QLineEdit::textChanged, this, &MainWindow::updateFilter);
+    connect(m_keywordCombo, &QComboBox::currentIndexChanged, this, &MainWindow::updateFilter);
+    connect(m_languageCombo, &QComboBox::currentIndexChanged, this, &MainWindow::updateFilter);
+    connect(m_regexCheck, &QCheckBox::toggled, this, &MainWindow::updateFilter);
+    connect(customBtn, &QPushButton::clicked, this, &MainWindow::editCustomFilter);
+    connect(clearBtn, &QPushButton::clicked, this, &MainWindow::clearFilters);
+    connect(m_table->selectionModel(), &QItemSelectionModel::currentRowChanged, this, &MainWindow::showCurrentComment);
+    connect(selectAllBtn, &QPushButton::clicked, this, &MainWindow::selectVisible);
+    connect(deselectAllBtn, &QPushButton::clicked, this, &MainWindow::deselectAll);
+    connect(m_deleteBtn, &QPushButton::clicked, this, &MainWindow::previewDeletion);
+    connect(m_applyBtn, &QPushButton::clicked, this, &MainWindow::applyChanges);
+    connect(m_discardBtn, &QPushButton::clicked, this, &MainWindow::discardChanges);
+}
+
+// ---------------------------------------------------------------- scanning
+
+void MainWindow::selectFolder() {
+    const QString dir = QFileDialog::getExistingDirectory(this, tr("Select Folder to Scan"),
+                                                          m_rootPath.isEmpty() ? QDir::homePath() : m_rootPath);
+    if (dir.isEmpty()) return;
+    m_rootPath = QDir(dir).absolutePath();
+    m_pathLabel->setText(QDir::toNativeSeparators(m_rootPath));
+    rescan();
+}
+
+void MainWindow::rescan() {
+    if (m_rootPath.isEmpty()) return;
+    if (!QDir(m_rootPath).exists()) {
+        QMessageBox::warning(this, tr("Scan Error"), tr("Folder does not exist: %1").arg(m_rootPath));
         return;
     }
-    
-    // Get the source model index
-    QModelIndex sourceIndex = m_filterProxy->mapToSource(current);
-    const Comment* comment = m_commentModel->commentAt(sourceIndex.row());
-    
-    if (comment) {
-        // Read file content
-        QFile file(comment->filePath);
-        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream in(&file);
-            QString content = in.readAll();
-            file.close();
-            
-            m_diffPreview->setOriginal(content, comment->language);
-            
-            // Generate preview of deletion
-            QVector<Comment> toDelete;
-            toDelete.append(*comment);
-            
-            auto edits = m_editPlanner->planEdits(toDelete);
-            if (edits.contains(comment->filePath)) {
-                EditResult result = m_editPlanner->previewEdits(comment->filePath, edits[comment->filePath]);
-                m_diffPreview->setModified(result.modifiedContent);
-            }
+    stopBackgroundWork();
+    m_model->clear();
+    m_pendingPlan.clear();
+    m_preview->clear();
 
-            m_diffPreview->highlightComment(*comment);
-        }
+    const AppSettings settings = AppSettings::load();
+    m_extractor.setKeywords(settings.keywords);
+    m_extractor.setParserMethod(CommentExtractor::ParserMethod(settings.parserMethod));
+    const QString keyword = m_keywordCombo->currentText();
+    m_keywordCombo->blockSignals(true);
+    m_keywordCombo->clear();
+    m_keywordCombo->addItem(tr("All Keywords"));
+    m_keywordCombo->addItems(settings.keywords);
+    m_keywordCombo->setCurrentIndex(std::max(0, m_keywordCombo->findText(keyword)));
+    m_keywordCombo->blockSignals(false);
+    updateFilter();
+
+    FileCrawler::Options options;
+    options.rootPath = m_rootPath;
+    options.ignorePatterns = settings.ignorePatterns;
+    options.useGitignore = settings.useGitignore;
+    setBusy(true);
+    m_progress->setRange(0, 0);
+    m_statusLabel->setText(tr("Scanning..."));
+    m_scanHandled = false;
+    m_scanWatcher.setFuture(FileCrawler::scan(options));
+}
+
+void MainWindow::cancelScan() {
+    m_scanWatcher.cancel();
+    m_extractWatcher.cancel();
+}
+
+void MainWindow::stopBackgroundWork() {
+    cancelScan();
+    m_scanWatcher.waitForFinished();
+    m_extractWatcher.waitForFinished();
+    m_scanHandled = m_extractHandled = true;
+    m_flushTimer.stop();
+    QMutexLocker lock(&m_inboxMutex);
+    m_inbox = {};
+}
+
+void MainWindow::onScanFinished() {
+    if (m_scanHandled || !m_scanWatcher.isFinished()) return;
+    m_scanHandled = true;
+    const QFuture<FileCrawler::Result> future = m_scanWatcher.future();
+    if (future.isCanceled() || future.resultCount() == 0) {
+        setBusy(false);
+        m_statusLabel->setText(tr("Scan cancelled"));
+        return;
     }
-    
-    updateActionStates();
+    const FileCrawler::Result result = future.result();
+    m_statusLabel->setText(tr("Scan complete: %1 files, %2 code files. Extracting comments...")
+                               .arg(result.totalFiles).arg(result.files.size()));
+    m_files = result.files;
+    m_progress->setRange(0, int(m_files.size()));
+    m_progress->setValue(0);
+
+    // Parse files on all cores; results are collected in the inbox and shown in batches.
+    const CommentExtractor* extractor = &m_extractor;
+    const QString prefix = m_rootPath.endsWith(u'/') ? m_rootPath : m_rootPath + u'/';
+    m_extractHandled = false;
+    m_extractWatcher.setFuture(QtConcurrent::map(m_files, [this, extractor, prefix](const QString& file) {
+        QVector<Comment> comments =
+            extractor->extractFromFile(file, file.startsWith(prefix) ? file.mid(prefix.size()) : file);
+        if (comments.isEmpty()) return;
+        QMutexLocker lock(&m_inboxMutex);
+        m_inbox.append(std::move(comments));
+    }));
+    m_flushTimer.start();
 }
 
-void MainWindow::onSearchTextChanged(const QString& text) {
-    m_filterProxy->setSearchText(text);
-}
-
-void MainWindow::onKeywordFilterChanged() {
-    QString keyword = m_keywordFilterCombo->currentText();
-    if (keyword == "All Keywords") {
-        m_filterProxy->setKeywordFilter({});
-    } else {
-        m_filterProxy->setKeywordFilter({keyword});
+void MainWindow::flushExtracted() {
+    QVector<Comment> batch;
+    {
+        QMutexLocker lock(&m_inboxMutex);
+        batch.swap(m_inbox);
     }
+    m_model->addComments(batch);
 }
 
-void MainWindow::onLanguageFilterChanged(const QString& language) {
-    if (language == "All Languages") {
-        m_filterProxy->setLanguageFilter({});
-    } else {
-        m_filterProxy->setLanguageFilter({language});
+void MainWindow::onExtractionFinished() {
+    if (m_extractHandled || !m_extractWatcher.isFinished()) return;
+    m_extractHandled = true;
+    m_flushTimer.stop();
+    flushExtracted();
+    m_files = {};
+    setBusy(false);
+    const int count = m_model->totalCount();
+    m_statusLabel->setText(m_extractWatcher.isCanceled() ? tr("Cancelled: %1 comments found so far").arg(count)
+                                                         : tr("Found %1 comments").arg(count));
+    const QString language = m_languageCombo->currentText();
+    m_languageCombo->blockSignals(true);
+    m_languageCombo->clear();
+    m_languageCombo->addItem(tr("All Languages"));
+    m_languageCombo->addItems(m_model->languages());
+    m_languageCombo->setCurrentIndex(std::max(0, m_languageCombo->findText(language)));
+    m_languageCombo->blockSignals(false);
+    updateFilter();
+}
+
+// ---------------------------------------------------------------- browsing
+
+void MainWindow::showCurrentComment() {
+    const Comment* c = m_model->commentAt(m_proxy->mapToSource(m_table->currentIndex()).row());
+    if (!c) return m_preview->clear();
+    // While a deletion is pending for this file, show the whole pending result.
+    const auto pending = m_pendingPlan.constFind(c->filePath);
+    showPreview(c->filePath, pending != m_pendingPlan.cend() ? *pending : QVector<EditRange>{EditPlanner::rangeFor(*c)},
+                c->language, c->startLine);
+}
+
+void MainWindow::showPreview(const QString& filePath, const QVector<EditRange>& ranges, const QString& language,
+                             int focusLine) {
+    const EditResult result = EditPlanner::preview(filePath, ranges);
+    if (!result.ok()) {
+        m_preview->clear();
+        m_statusLabel->setText(result.errorMessage);
+        return;
     }
+    m_preview->showDiff(result.original.text, result.modifiedContent, language, ranges, focusLine);
 }
 
-void MainWindow::onRegexToggled(bool checked) {
-    m_filterProxy->setUseRegex(checked);
+void MainWindow::updateFilter() {
+    CommentFilterProxy::Filter filter;
+    filter.search = m_search->text();
+    filter.regex = m_regexCheck->isChecked();
+    if (m_keywordCombo->currentIndex() > 0) filter.keyword = m_keywordCombo->currentText();
+    if (m_languageCombo->currentIndex() > 0) filter.language = m_languageCombo->currentText();
+    filter.path = m_customPath;
+    filter.type = m_customType;
+    m_proxy->setFilter(filter);
 }
 
-void MainWindow::onClearFilters() {
-    m_searchEdit->clear();
-    m_keywordFilterCombo->setCurrentIndex(0);
-    m_languageFilterCombo->setCurrentIndex(0);
-    m_regexCheck->setChecked(false);
-    m_filterProxy->clearFilters();
-    m_customPathFilter.clear();
-    m_customTypeFilter.clear();
-    m_filterProxy->setPathFilter(QString());
-    m_filterProxy->setTypeFilter({});
-}
-
-void MainWindow::onCustomFilter() {
+void MainWindow::editCustomFilter() {
     QDialog dialog(this);
-    dialog.setWindowTitle("Custom Filter");
+    dialog.setWindowTitle(tr("Custom Filter"));
+    auto* form = new QFormLayout(&dialog);
+    auto* pathEdit = new QLineEdit(m_customPath);
+    form->addRow(tr("File path contains:"), pathEdit);
+    auto* languageCombo = new QComboBox;
+    for (int i = 0; i < m_languageCombo->count(); ++i) languageCombo->addItem(m_languageCombo->itemText(i));
+    languageCombo->setCurrentIndex(m_languageCombo->currentIndex());
+    form->addRow(tr("Language:"), languageCombo);
+    auto* typeCombo = new QComboBox;
+    typeCombo->addItems({tr("All Types"), "Line", "Block", "Doc", "Inline"});
+    typeCombo->setCurrentIndex(std::max(0, typeCombo->findText(m_customType)));
+    form->addRow(tr("Comment type:"), typeCombo);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
 
-    QFormLayout* formLayout = new QFormLayout(&dialog);
+    m_customPath = pathEdit->text().trimmed();
+    m_customType = typeCombo->currentIndex() > 0 ? typeCombo->currentText() : QString();
+    m_languageCombo->setCurrentIndex(languageCombo->currentIndex());  // also refreshes the filter
+    updateFilter();
+}
 
-    QLineEdit* pathEdit = new QLineEdit(m_customPathFilter, &dialog);
-    formLayout->addRow("File path contains:", pathEdit);
+void MainWindow::clearFilters() {
+    m_customPath.clear();
+    m_customType.clear();
+    for (QWidget* w : std::initializer_list<QWidget*>{m_search, m_keywordCombo, m_languageCombo, m_regexCheck})
+        w->blockSignals(true);
+    m_search->clear();
+    m_keywordCombo->setCurrentIndex(0);
+    m_languageCombo->setCurrentIndex(0);
+    m_regexCheck->setChecked(false);
+    for (QWidget* w : std::initializer_list<QWidget*>{m_search, m_keywordCombo, m_languageCombo, m_regexCheck})
+        w->blockSignals(false);
+    updateFilter();
+}
 
-    QComboBox* languageCombo = new QComboBox(&dialog);
-    languageCombo->addItem("All Languages");
-    for (int i = 1; i < m_languageFilterCombo->count(); ++i) {
-        languageCombo->addItem(m_languageFilterCombo->itemText(i));
-    }
-    languageCombo->setCurrentText(m_languageFilterCombo->currentText());
-    formLayout->addRow("Language:", languageCombo);
+void MainWindow::selectVisible() {
+    if (m_proxy->rowCount() == m_model->totalCount()) return m_model->setSelected({}, true);
+    QVector<int> rows;
+    rows.reserve(m_proxy->rowCount());
+    for (int r = 0; r < m_proxy->rowCount(); ++r) rows << m_proxy->mapToSource(m_proxy->index(r, 0)).row();
+    m_model->setSelected(rows, true);
+}
 
-    QComboBox* typeCombo = new QComboBox(&dialog);
-    typeCombo->addItem("All Types");
-    typeCombo->addItem("Line");
-    typeCombo->addItem("Block");
-    typeCombo->addItem("Doc");
-    typeCombo->addItem("Inline");
-    if (!m_customTypeFilter.isEmpty()) {
-        typeCombo->setCurrentText(m_customTypeFilter);
-    }
-    formLayout->addRow("Comment type:", typeCombo);
+void MainWindow::deselectAll() { m_model->setSelected({}, false); }
 
-    QDialogButtonBox* buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    formLayout->addRow(buttonBox);
+// ---------------------------------------------------------------- deleting
 
-    connect(buttonBox, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+void MainWindow::previewDeletion() {
+    const QVector<const Comment*> selected = m_model->selectedComments();
+    if (selected.isEmpty()) return;
+    m_pendingPlan = EditPlanner::plan(selected);
+    const Comment* first = selected.first();
+    showPreview(first->filePath, m_pendingPlan.value(first->filePath), first->language, first->startLine);
+    m_statusLabel->setText(tr("Preview: %1 comment(s) in %2 file(s) would be removed. Click a row to review a file.")
+                               .arg(selected.size()).arg(m_pendingPlan.size()));
+    updateActions();
+}
 
-    if (dialog.exec() != QDialog::Accepted) {
+void MainWindow::applyChanges() {
+    if (m_pendingPlan.isEmpty()) return;
+    if (QMessageBox::question(this, tr("Apply Changes"),
+                              tr("This will modify %1 file(s). Continue?").arg(m_pendingPlan.size())) != QMessageBox::Yes)
         return;
-    }
 
-    m_customPathFilter = pathEdit->text().trimmed();
-    m_filterProxy->setPathFilter(m_customPathFilter);
-
-    QString selectedLanguage = languageCombo->currentText();
-    if (selectedLanguage == "All Languages") {
-        m_filterProxy->setLanguageFilter({});
-        m_languageFilterCombo->setCurrentIndex(0);
-    } else {
-        m_filterProxy->setLanguageFilter({selectedLanguage});
-        m_languageFilterCombo->setCurrentText(selectedLanguage);
+    const AppSettings settings = AppSettings::load();
+    m_writer.setBackupsEnabled(settings.backupsEnabled);
+    m_writer.setBackupDirectory(settings.backupDirectory);
+    QSet<QString> changed;
+    QStringList failures;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    for (auto it = m_pendingPlan.cbegin(); it != m_pendingPlan.cend(); ++it) {
+        QString error;
+        if (m_writer.apply(it.key(), it.value(), &error)) changed.insert(it.key());
+        else failures << relativePath(it.key()) + ": " + error;
     }
+    // Re-parse the modified files so the table's line numbers match the files again.
+    QVector<Comment> fresh;
+    for (const QString& file : changed) fresh += m_extractor.extractFromFile(file, relativePath(file));
+    m_model->replaceFiles(changed, fresh);
+    QApplication::restoreOverrideCursor();
 
-    QString selectedType = typeCombo->currentText();
-    if (selectedType == "All Types") {
-        m_customTypeFilter.clear();
-        m_filterProxy->setTypeFilter({});
-    } else {
-        m_customTypeFilter = selectedType;
-        m_filterProxy->setTypeFilter({selectedType});
-    }
+    m_pendingPlan.clear();
+    m_preview->clear();
+    m_statusLabel->setText(tr("Applied changes to %1 file(s)").arg(changed.size()));
+    if (!failures.isEmpty())
+        QMessageBox::warning(this, tr("Some Files Were Not Modified"), failures.join(u'\n'));
+    updateActions();
 }
 
-void MainWindow::onDeleteSelected() {
-    QVector<Comment*> selected = m_commentModel->selectedComments();
-    if (selected.isEmpty()) {
-        QMessageBox::information(this, "No Selection", "Please select comments to delete.");
-        return;
-    }
-    
-    // Convert to value vector
-    QVector<Comment> toDelete;
-    for (Comment* c : selected) {
-        toDelete.append(*c);
-    }
-    
-    // Plan edits
-    m_pendingEdits.clear();
-    auto editsByFile = m_editPlanner->planEdits(toDelete);
-    
-    // Generate previews
-    for (auto it = editsByFile.begin(); it != editsByFile.end(); ++it) {
-        EditResult result = m_editPlanner->previewEdits(it.key(), it.value());
-        m_pendingEdits[it.key()] = result;
-    }
-    
-    m_hasPendingChanges = !m_pendingEdits.isEmpty();
-    
-    // Show preview for first file
-    if (!m_pendingEdits.isEmpty()) {
-        auto first = m_pendingEdits.begin();
-        QString language;
-        for (const Comment& c : toDelete) {
-            if (c.filePath == first.key()) {
-                language = c.language;
-                break;
-            }
-        }
-        m_diffPreview->setFromEditResult(first.value(), language);
-    }
-    
-    updateActionStates();
-    
-    m_statusLabel->setText(QString("Preview: %1 file(s) would be modified")
-                          .arg(m_pendingEdits.size()));
+void MainWindow::discardChanges() {
+    m_pendingPlan.clear();
+    m_preview->clear();
+    m_model->setSelected({}, false);
+    m_statusLabel->setText(tr("Changes discarded"));
 }
 
-void MainWindow::onPreviewDeletion() {
-    onDeleteSelected();
+// ---------------------------------------------------------------- other actions
+
+void MainWindow::openSettings() {
+    SettingsDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted && !m_rootPath.isEmpty() &&
+        QMessageBox::question(this, tr("Settings Saved"), tr("Rescan the folder with the new settings?")) == QMessageBox::Yes)
+        rescan();
 }
 
-void MainWindow::onApplyChanges() {
-    if (m_pendingEdits.isEmpty()) {
-        return;
-    }
-    
-    int reply = QMessageBox::question(this, "Apply Changes",
-        QString("This will modify %1 file(s). Continue?").arg(m_pendingEdits.size()),
-        QMessageBox::Yes | QMessageBox::No);
-    
-    if (reply != QMessageBox::Yes) {
-        return;
-    }
-    
-    // Load settings
-    QSettings settings;
-    settings.beginGroup("FileWriter");
-    bool backupsEnabled = settings.value("backupsEnabled", true).toBool();
-    QString backupDir = settings.value("backupDirectory").toString();
-    settings.endGroup();
-    
-    m_fileWriter->setBackupsEnabled(backupsEnabled);
-    if (!backupDir.isEmpty()) {
-        m_fileWriter->setBackupDirectory(backupDir);
-    }
-    
-    // Apply edits
-    int successCount = m_fileWriter->applyAllEdits(m_pendingEdits);
-    
-    // Remove deleted comments from model
-    QVector<int> deletedIds;
-    for (const auto& result : m_pendingEdits) {
-        for (const auto& edit : result.appliedEdits) {
-            deletedIds.append(edit.commentId);
-        }
-    }
-    m_commentModel->removeComments(deletedIds);
-    
-    // Clear pending changes
-    m_pendingEdits.clear();
-    m_hasPendingChanges = false;
-    m_diffPreview->clear();
-    
-    // Update status
-    m_statusLabel->setText(QString("Applied changes to %1 file(s)").arg(successCount));
-    
-    updateActionStates();
-}
-
-void MainWindow::onDiscardChanges() {
-    m_pendingEdits.clear();
-    m_hasPendingChanges = false;
-    m_diffPreview->clear();
-    m_commentModel->deselectAll();
-    m_statusLabel->setText("Changes discarded");
-    updateActionStates();
-}
-
-void MainWindow::onSettings() {
-    if (!m_settingsDialog) {
-        m_settingsDialog = new SettingsDialog(this);
-    }
-    
-    m_settingsDialog->loadSettings();
-    m_settingsDialog->exec();
-}
-
-void MainWindow::onExportComments() {
-    QString fileName = QFileDialog::getSaveFileName(this, "Export Comments",
-        QDir::homePath() + "/comments.csv", "CSV Files (*.csv);;All Files (*)");
-    
-    if (fileName.isEmpty()) {
-        return;
-    }
-    
+void MainWindow::exportComments() {
+    const QString fileName = QFileDialog::getSaveFileName(this, tr("Export Comments"), QDir::homePath() + "/comments.csv",
+                                                          tr("CSV Files (*.csv);;All Files (*)"));
+    if (fileName.isEmpty()) return;
     QFile file(fileName);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QMessageBox::warning(this, "Export Error", "Could not open file for writing.");
+        QMessageBox::warning(this, tr("Export Error"), tr("Could not open file for writing."));
         return;
     }
-    
+    const auto quoted = [](QString s) { return u'"' + s.replace(u'"', QLatin1String("\"\"")) + u'"'; };
     QTextStream out(&file);
-    
-    // Header
     out << "File,Line,Type,Keywords,Comment,Language\n";
-    
-    // Data
-    for (int i = 0; i < m_commentModel->totalCount(); i++) {
-        const Comment* c = m_commentModel->commentAt(i);
-        if (c) {
-            // Escape CSV fields
-            QString comment = c->cleanText;
-            comment.replace("\"", "\"\"");
-            
-            out << "\"" << c->relativePath << "\","
-                << c->startLine << ","
-                << c->typeString() << ","
-                << "\"" << c->keywordsString() << "\","
-                << "\"" << comment << "\","
-                << c->language << "\n";
-        }
-    }
-    
-    file.close();
-    m_statusLabel->setText("Comments exported to " + fileName);
+    for (const Comment& c : m_model->comments())
+        out << quoted(c.relativePath) << ',' << c.startLine << ',' << c.typeString() << ',' << quoted(c.keywordsString())
+            << ',' << quoted(c.cleanText()) << ',' << quoted(c.language) << '\n';
+    m_statusLabel->setText(tr("Comments exported to %1").arg(fileName));
 }
 
-void MainWindow::onExportAuditLog() {
-    QString fileName = QFileDialog::getSaveFileName(this, "Export Audit Log",
-        QDir::homePath() + "/audit-log.txt", "Text Files (*.txt);;All Files (*)");
-    
-    if (!fileName.isEmpty()) {
-        if (m_fileWriter->exportAuditLog(fileName)) {
-            m_statusLabel->setText("Audit log exported to " + fileName);
-        } else {
-            QMessageBox::warning(this, "Export Error", "Could not export audit log.");
-        }
-    }
+void MainWindow::exportAuditLog() {
+    const QString fileName = QFileDialog::getSaveFileName(this, tr("Export Audit Log"), QDir::homePath() + "/audit-log.txt",
+                                                          tr("Text Files (*.txt);;All Files (*)"));
+    if (fileName.isEmpty()) return;
+    if (m_writer.exportAuditLog(fileName)) m_statusLabel->setText(tr("Audit log exported to %1").arg(fileName));
+    else QMessageBox::warning(this, tr("Export Error"), tr("Could not export audit log."));
 }
 
-void MainWindow::onAbout() {
-    QMessageBox::about(this, "About Comment Explorer & Cleaner",
-        "<h2>Comment Explorer & Cleaner</h2>"
-        "<p>Version 1.0.0</p>"
-        "<p>A professional tool for exploring and safely removing code comments "
-        "across multiple programming languages.</p>"
-        "<p>Features:</p>"
-        "<ul>"
-        "<li>Support for 30+ programming languages</li>"
-        "<li>Accurate comment extraction</li>"
-        "<li>Safe deletion with preview</li>"
-        "<li>Automatic backups</li>"
-        "<li>Audit logging</li>"
-        "</ul>");
-}
-
-void MainWindow::onSelectAll() {
-    m_commentModel->selectAll();
-}
-
-void MainWindow::onDeselectAll() {
-    m_commentModel->deselectAll();
-}
-
-void MainWindow::updateStatusBar() {
-    int total = m_commentModel->totalCount();
-    int selected = m_commentModel->selectedCount();
-    m_countsLabel->setText(QString("Selected: %1 / %2").arg(selected).arg(total));
-}
-
-void MainWindow::updatePreview() {
-    QModelIndex current = m_commentTable->currentIndex();
-    if (current.isValid()) {
-        onCommentSelected(current, QModelIndex());
-    }
-}
-
-void MainWindow::updateActionStates() {
-    bool hasComments = m_commentModel->totalCount() > 0;
-    bool hasSelection = m_commentModel->selectedCount() > 0;
-    bool hasPending = m_hasPendingChanges;
-    
-    m_deleteSelectedBtn->setEnabled(hasSelection);
-    m_previewBtn->setEnabled(hasSelection);
-    m_applyBtn->setEnabled(hasPending);
-    m_discardBtn->setEnabled(hasPending);
-    m_harvestBtn->setEnabled(hasComments);
-}
-
-void MainWindow::onHarvestSpecialComments() {
-    if (m_commentModel->totalCount() == 0) {
-        QMessageBox::information(this, "No Comments", "There are no comments scanned yet. Please select a folder and scan first.");
+void MainWindow::harvestSpecialComments() {
+    if (m_model->totalCount() == 0) {
+        QMessageBox::information(this, tr("No Comments"), tr("Please select a folder and scan it first."));
         return;
     }
-    
-    QString fileName = QFileDialog::getSaveFileName(this, "Harvest Special Comments",
-        QDir::homePath() + "/special_comments_harvest.txt", "Text Files (*.txt);;All Files (*)");
-    
-    if (fileName.isEmpty()) {
-        return;
-    }
-    
+    const QString fileName = QFileDialog::getSaveFileName(this, tr("Harvest Special Comments"),
+                                                          QDir::homePath() + "/special_comments_harvest.txt",
+                                                          tr("Text Files (*.txt);;All Files (*)"));
+    if (fileName.isEmpty()) return;
     QFile file(fileName);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QMessageBox::warning(this, "Export Error", "Could not open file for writing.");
+        QMessageBox::warning(this, tr("Export Error"), tr("Could not open file for writing."));
         return;
     }
-    
+
+    static const QStringList terms = {"todo", "fix", "hack", "fix later", "partial implmentation",
+                                      "partial implementation", "simple implmentation", "simple implementation",
+                                      "example", "do later", "unstable", "xxx", "bug", "deprecated", "warning",
+                                      "optimize", "review"};
+    const auto isSpecial = [](const Comment* c) {
+        return std::any_of(terms.begin(), terms.end(), [c](const QString& t) { return c->rawText.contains(t, Qt::CaseInsensitive); });
+    };
+    const int contextLines = AppSettings::load().contextLines;
+    const QString rule(80, u'=');
+    const QString thinRule(80, u'-');
+
+    QMap<QString, QVector<const Comment*>> byFile;
+    for (const Comment& c : m_model->comments()) byFile[c.filePath] << &c;
+
     QTextStream out(&file);
-    
-    // Group comments by file path
-    QMap<QString, QVector<Comment>> commentsByFile;
-    const auto& allComments = m_commentModel->comments();
-    for (const Comment& c : allComments) {
-        commentsByFile[c.filePath].append(c);
-    }
-    
-    // Define special keywords list
-    static const QStringList matchTerms = {
-        "todo", "fix", "hack", "fix later", 
-        "partial implmentation", "partial implementation",
-        "simple implmentation", "simple implementation",
-        "example", "do later", "unstable",
-        "xxx", "bug", "deprecated", "warning", "optimize", "review"
-    };
-    
-    auto isSpecial = [](const Comment& comment) -> bool {
-        QString cleanTextLower = comment.cleanText.toLower();
-        QString rawTextLower = comment.rawText.toLower();
-        
-        for (const QString& term : matchTerms) {
-            if (cleanTextLower.contains(term) || rawTextLower.contains(term)) {
-                return true;
-            }
-        }
-        return false;
-    };
-    
-    int exportedGroupsCount = 0;
-    int exportedCommentsCount = 0;
-    
-    out << "================================================================================\n";
-    out << "COMMENT TRACKER - SPECIAL COMMENTS HARVEST REPORT\n";
-    out << "Generated on: " << QDateTime::currentDateTime().toString(Qt::ISODate) << "\n";
-    out << "Keywords searched: " << matchTerms.join(", ") << "\n";
-    out << "================================================================================\n\n";
-    
-    for (auto it = commentsByFile.begin(); it != commentsByFile.end(); ++it) {
-        QVector<Comment> fileComments = it.value();
-        
-        // Sort by start line
-        std::sort(fileComments.begin(), fileComments.end(), [](const Comment& a, const Comment& b) {
-            if (a.startLine != b.startLine) {
-                return a.startLine < b.startLine;
-            }
-            return a.startColumn < b.startColumn;
+    out << rule << "\nCOMMENT TRACKER - SPECIAL COMMENTS HARVEST REPORT\n"
+        << "Generated on: " << QDateTime::currentDateTime().toString(Qt::ISODate) << '\n'
+        << "Keywords searched: " << terms.join(", ") << '\n' << rule << "\n\n";
+
+    int groups = 0, harvested = 0;
+    for (auto it = byFile.begin(); it != byFile.end(); ++it) {
+        QVector<const Comment*>& comments = it.value();
+        std::sort(comments.begin(), comments.end(), [](const Comment* a, const Comment* b) {
+            return std::pair(a->startLine, a->startColumn) < std::pair(b->startLine, b->startColumn);
         });
-        
-        // Partition comments into groups where the gap between consecutive comments is <= 2 lines
-        QVector<QVector<Comment>> groups;
-        if (!fileComments.isEmpty()) {
-            QVector<Comment> currentGroup;
-            currentGroup.append(fileComments[0]);
-            
-            for (int i = 1; i < fileComments.size(); ++i) {
-                const Comment& prev = currentGroup.last();
-                const Comment& curr = fileComments[i];
-                
-                // Gap in lines
-                int gap = qMax(0, curr.startLine - prev.endLine - 1);
-                if (gap <= 2) {
-                    currentGroup.append(curr);
-                } else {
-                    groups.append(currentGroup);
-                    currentGroup.clear();
-                    currentGroup.append(curr);
-                }
+        QStringList lines;  // file content, loaded only if something in it is harvested
+        const auto context = [&](int first, int last) {  // 1-based inclusive line range
+            if (lines.isEmpty()) {
+                TextFile text;
+                if (text.read(it.key())) lines = text.text.split(u'\n');
             }
-            if (!currentGroup.isEmpty()) {
-                groups.append(currentGroup);
-            }
-        }
-        
-        // Export groups that contain at least one special comment
-        for (const auto& group : groups) {
-            bool hasSpecial = false;
-            for (const Comment& c : group) {
-                if (isSpecial(c)) {
-                    hasSpecial = true;
-                    break;
-                }
-            }
-            
-            if (!hasSpecial) {
-                continue;
-            }
-            
-            exportedGroupsCount++;
-            exportedCommentsCount += group.size();
-            
-            const Comment& firstC = group.first();
-            const Comment& lastC = group.last();
-            
-            out << "--------------------------------------------------------------------------------\n";
-            out << "FILE: " << firstC.relativePath << " (" << firstC.language << ")\n";
-            out << "LINE RANGE: " << firstC.startLine << " - " << lastC.endLine << "\n";
-            out << "--------------------------------------------------------------------------------\n";
-            
-            if (!firstC.contextBefore.isEmpty()) {
-                out << "--- CODE CONTEXT BEFORE ---\n";
-                out << firstC.contextBefore << "\n\n";
-            }
-            
+            first = std::max(first, 1);
+            last = std::min(last, int(lines.size()));
+            return first > last ? QString() : lines.mid(first - 1, last - first + 1).join(u'\n');
+        };
+
+        // Group comments that are at most two lines apart; report groups containing a special comment.
+        for (qsizetype i = 0, j = 0; i < comments.size(); i = j) {
+            for (j = i + 1; j < comments.size() && comments[j]->startLine - comments[j - 1]->endLine <= 3; ++j) {}
+            if (std::none_of(comments.begin() + i, comments.begin() + j, isSpecial)) continue;
+            const Comment& first = *comments[i];
+            const Comment& last = *comments[j - 1];
+            ++groups;
+            harvested += int(j - i);
+            out << thinRule << "\nFILE: " << first.relativePath << " (" << first.language << ")\n"
+                << "LINE RANGE: " << first.startLine << " - " << last.endLine << '\n' << thinRule << '\n';
+            if (const QString before = context(first.startLine - contextLines, first.startLine - 1); !before.isEmpty())
+                out << "--- CODE CONTEXT BEFORE ---\n" << before << "\n\n";
             out << "--- COMMENTS ---\n";
-            for (const Comment& c : group) {
-                QString matchedIndicator = isSpecial(c) ? " [MATCH]" : " [CONTEXT COMMENT]";
-                out << "[Line " << c.startLine << " - " << c.endLine << " | Type: " << c.typeString() << "]" << matchedIndicator << "\n";
-                out << c.rawText << "\n\n";
-            }
-            
-            if (!lastC.contextAfter.isEmpty()) {
-                out << "--- CODE CONTEXT AFTER ---\n";
-                out << lastC.contextAfter << "\n";
-            }
-            
-            out << "\n";
+            for (qsizetype k = i; k < j; ++k)
+                out << "[Line " << comments[k]->startLine << " - " << comments[k]->endLine << " | Type: "
+                    << comments[k]->typeString() << "]" << (isSpecial(comments[k]) ? " [MATCH]" : " [CONTEXT COMMENT]")
+                    << '\n' << comments[k]->rawText << "\n\n";
+            if (const QString after = context(last.endLine + 1, last.endLine + contextLines); !after.isEmpty())
+                out << "--- CODE CONTEXT AFTER ---\n" << after << '\n';
+            out << '\n';
         }
     }
-    
-    out << "================================================================================\n";
-    out << "SUMMARY:\n";
-    out << "Total special comment groups harvested: " << exportedGroupsCount << "\n";
-    out << "Total comments included (matching + surrounding): " << exportedCommentsCount << "\n";
-    out << "================================================================================\n";
-    
-    file.close();
-    m_statusLabel->setText(QString("Harvested %1 comments into %2").arg(exportedCommentsCount).arg(fileName));
-    QMessageBox::information(this, "Harvest Complete", 
-        QString("Successfully harvested %1 comments (including context) into:\n%2").arg(exportedCommentsCount).arg(fileName));
+    out << rule << "\nSUMMARY:\nTotal special comment groups harvested: " << groups << '\n'
+        << "Total comments included (matching + surrounding): " << harvested << '\n' << rule << '\n';
+
+    m_statusLabel->setText(tr("Harvested %1 comments into %2").arg(harvested).arg(fileName));
+    QMessageBox::information(this, tr("Harvest Complete"),
+                             tr("Successfully harvested %1 comments (including context) into:\n%2").arg(harvested).arg(fileName));
 }
+
+void MainWindow::showAbout() {
+    QMessageBox::about(this, tr("About Comment Explorer & Cleaner"),
+                       tr("<h2>Comment Explorer &amp; Cleaner</h2><p>Version %1</p>"
+                          "<p>Explore and safely remove code comments across 30+ programming languages.</p>"
+                          "<ul><li>Lexer and Tree-sitter based extraction</li><li>Safe deletion with preview</li>"
+                          "<li>Automatic backups</li><li>Audit logging</li></ul>")
+                           .arg(QCoreApplication::applicationVersion()));
+}
+
+// ---------------------------------------------------------------- helpers
+
+void MainWindow::setBusy(bool busy) {
+    m_busy = busy;
+    m_progress->setVisible(busy);
+    updateActions();
+}
+
+void MainWindow::updateActions() {
+    const bool pending = !m_pendingPlan.isEmpty();
+    m_rescanAct->setEnabled(!m_rootPath.isEmpty());
+    m_cancelAct->setEnabled(m_busy);
+    m_harvestAct->setEnabled(!m_busy && m_model->totalCount() > 0);
+    m_deleteBtn->setEnabled(!m_busy && m_model->selectedCount() > 0);
+    m_applyBtn->setEnabled(!m_busy && pending);
+    m_discardBtn->setEnabled(pending);
+}
+
+QString MainWindow::relativePath(const QString& filePath) const { return QDir(m_rootPath).relativeFilePath(filePath); }

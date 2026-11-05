@@ -59,7 +59,7 @@ Click **Clear** to reset all filters.
 
 Check the boxes in the first column to select comments for deletion. Use:
 
-- **Select All**: Select all comments, regardless of current filters
+- **Select All**: Select every comment that matches the current filters
 - **Deselect All**: Clear all selections, including those not currently visible
 
 ### 6. Preview Changes
@@ -69,11 +69,14 @@ Click **Delete Selected** to generate a preview. The right pane shows:
 - **Left side ("Current")**: Original file content with the comment highlighted
 - **Right side ("After Deletion")**: How the file will look after removal
 
-Both panes scroll together so you can compare.
+Both panes scroll together so you can compare. While a deletion is pending, clicking any row
+shows the pending result for that row's file.
 
 ### 7. Apply or Discard
 
-- **Apply Changes**: Write modifications to files (with automatic backup)
+- **Apply Changes**: Write modifications to files (with automatic backup). Each file is checked again
+  just before writing; if it changed since the scan it is left untouched and you are asked to rescan.
+  Modified files are re-scanned so line numbers in the table stay correct.
 - **Discard**: Cancel and clear the selection
 
 ## Comment Deletion Rules
@@ -115,6 +118,22 @@ After deletion:
 int x = 5;
 ```
 
+### Comments Next to Code
+
+Only the comment is removed; code on the same line is always kept, and line endings
+(LF/CRLF) and UTF-8 byte order marks are preserved.
+
+```cpp
+int a = 1; /* note */ int b = 2;
+/* header */ int c = 3;
+```
+
+After deletion:
+```cpp
+int a = 1; int b = 2;
+int c = 3;
+```
+
 ## Settings
 
 Access via **Edit → Settings**.
@@ -126,26 +145,32 @@ Glob patterns for files and folders to skip during scanning:
 - `.git` - Skip version control folders
 - `node_modules` - Skip npm dependencies
 - `*.min.js` - Skip minified files
-- `build/*` - Skip build output
+- `build/*` - Skip files directly inside the top-level `build` folder
+
+Patterns use `.gitignore` syntax: a name without `/` matches at any depth (`build` matches
+`a/build` but not `builder.cpp`), a pattern containing `/` is relative to the scanned folder,
+a trailing `/` matches folders only, `**` spans folders and `!` re-includes a path.
+Files larger than 10 MB, binary files and symbolic links to folders are skipped.
 
 ### Use .gitignore
 
-When enabled, the scanner respects `.gitignore` files in the project.
+When enabled, the scanner respects `.gitignore` files in the project, including ones in subfolders.
 
 ### Context Lines
 
-Number of lines to capture before and after each comment for context display.
+Number of code lines to include before and after each group in the special-comments harvest report.
 
 ### Backups
 
 - **Enable backups**: Create backup files before modifying
-- **Backup directory**: Where to store backups (default: `.comment-explorer-backups`)
+- **Backup directory**: Where to store backups (default: a `.comment-explorer-backups` folder next to each file)
 
 ### Parser Method
 
 Choose between:
 - **Lexer (Default)**: Fast extraction
-- **Tree-sitter**: Accurate parsing (recommended for supported languages like C++, Python, JS, JSON)
+- **Tree-sitter**: Accurate parsing for C/C++, Python, JavaScript and JSON. Other languages, and files the
+  grammar cannot parse (for example TypeScript type annotations), automatically use the lexer.
 
 ### Keywords
 
@@ -169,6 +194,7 @@ Columns: File, Line, Type, Keywords, Comment, Language
 |--------|----------|
 | Open Folder | Ctrl+O |
 | Rescan | F5 |
+| Cancel Scan | Esc |
 | Settings | - |
 | Quit | Ctrl+Q |
 
@@ -201,7 +227,7 @@ For very large projects:
 Backups are stored in `.comment-explorer-backups` by default. To restore:
 
 1. Navigate to the backup folder
-2. Find the file with the original name + timestamp
+2. Find the file named `<original name>_<path hash>.<timestamp>.bak`
 3. Copy it back to the original location
 
 ## Best Practices
